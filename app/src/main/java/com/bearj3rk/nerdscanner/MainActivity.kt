@@ -126,7 +126,7 @@ class MainActivity : AppCompatActivity() {
         }
         val input = EditText(this).apply {
             hint = "Card name, e.g. Black Lotus"
-            singleLine = true
+            setSingleLine(true)
             inputType = InputType.TYPE_CLASS_TEXT
             imeOptions = EditorInfo.IME_ACTION_SEARCH
         }
