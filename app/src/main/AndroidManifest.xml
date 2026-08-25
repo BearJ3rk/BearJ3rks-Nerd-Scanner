@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="true"
-        android:label="BearJ3rk's Nerd Scanner V0.3"
+        android:label="BearJ3rk's Nerd Scanner V0.4"
         android:theme="@style/Theme.NerdScanner"
         android:usesCleartextTraffic="false">
         <activity
