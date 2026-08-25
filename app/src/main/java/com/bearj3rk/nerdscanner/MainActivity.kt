@@ -3,7 +3,9 @@ package com.bearj3rk.nerdscanner
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.text.InputType
@@ -12,6 +14,7 @@ import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
@@ -26,6 +29,8 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import coil.load
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
@@ -51,6 +56,7 @@ class MainActivity : AppCompatActivity() {
     private val http = OkHttpClient.Builder().callTimeout(12, TimeUnit.SECONDS).build()
     private var lastLookupAt = 0L
     private var lookupInFlight = false
+    private var scannedBitmap: Bitmap? = null
 
     private val cameraPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) startCamera() else status.text = "Camera permission denied. Manual search still works."
@@ -66,6 +72,11 @@ class MainActivity : AppCompatActivity() {
         root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.rgb(245, 240, 230))
+        }
+        ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            view.setPadding(0, bars.top, 0, bars.bottom + dp(12))
+            insets
         }
         val title = TextView(this).apply {
             text = "BearJ3rk's Nerd Scanner"
@@ -97,6 +108,27 @@ class MainActivity : AppCompatActivity() {
     private fun showScanner() {
         clearContent()
         previewView = PreviewView(this).apply { scaleType = PreviewView.ScaleType.FILL_CENTER }
+        val cameraFrame = FrameLayout(this).apply {
+            setBackgroundColor(Color.BLACK)
+            addView(previewView, FrameLayout.LayoutParams(-1, -1))
+            addView(View(this@MainActivity).apply {
+                background = GradientDrawable().apply {
+                    setColor(Color.TRANSPARENT)
+                    setStroke(dp(3), Color.rgb(201, 154, 69))
+                    cornerRadius = dp(14).toFloat()
+                }
+            }, FrameLayout.LayoutParams(dp(250), dp(350), Gravity.CENTER))
+            addView(TextView(this@MainActivity).apply {
+                text = "SET SYMBOL + NUMBER"
+                textSize = 11f
+                gravity = Gravity.CENTER
+                setTextColor(Color.WHITE)
+                setBackgroundColor(Color.argb(180, 23, 21, 29))
+                setPadding(dp(8), dp(4), dp(8), dp(4))
+            }, FrameLayout.LayoutParams(dp(170), dp(30), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+                bottomMargin = dp(34)
+            })
+        }
         status = TextView(this).apply {
             text = "Center one card in the frame. Hold steady while its name is read."
             gravity = Gravity.CENTER
@@ -104,10 +136,10 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(16), dp(12), dp(16), dp(12))
         }
         progress = ProgressBar(this).apply { visibility = View.GONE }
-        root.addView(previewView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        root.addView(cameraFrame, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(410)))
         root.addView(status)
         root.addView(progress, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(32)))
-        root.addView(ScrollView(this).apply { addView(resultPanel) })
+        root.addView(ScrollView(this).apply { addView(resultPanel) }, LinearLayout.LayoutParams(-1, 0, 1f))
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             startCamera()
         } else cameraPermission.launch(Manifest.permission.CAMERA)
@@ -164,8 +196,13 @@ class MainActivity : AppCompatActivity() {
                 val image = InputImage.fromMediaImage(mediaImage, proxy.imageInfo.rotationDegrees)
                 recognizer.process(image)
                     .addOnSuccessListener { text ->
-                        val candidate = bestCardName(text.textBlocks.flatMap { it.lines }.map { it.text })
-                        if (candidate != null) lookupCard(candidate, fromCamera = true)
+                        val lines = text.textBlocks.flatMap { it.lines }.map { it.text }
+                        val candidate = bestCardName(lines)
+                        if (candidate != null) {
+                            scannedBitmap = previewView.bitmap
+                            val hints = printingHints(lines)
+                            lookupCard(candidate, hints.first, hints.second, fromCamera = true)
+                        }
                     }
                     .addOnCompleteListener { proxy.close() }
             }
@@ -180,15 +217,39 @@ class MainActivity : AppCompatActivity() {
         .filterNot { it.matches(Regex(".*[©™]|[0-9]{3,}.*")) }
         .firstOrNull()
 
-    private fun lookupCard(query: String, fromCamera: Boolean = false) {
+    private fun printingHints(lines: List<String>): Pair<String?, String?> {
+        val joined = lines.joinToString(" ").uppercase()
+        val modern = Regex("\\b([A-Z0-9]{3,6})\\s*[•·]\\s*[A-Z]{2}\\s+(\\d{1,4}[A-Z]?)\\b").find(joined)
+        if (modern != null) return modern.groupValues[1] to modern.groupValues[2]
+        val collector = Regex("\\b(\\d{1,4}[A-Z]?)\\s*/\\s*\\d{1,4}\\b").find(joined)?.groupValues?.get(1)
+        val setCode = lines.asReversed().asSequence()
+            .flatMap { Regex("\\b[A-Z0-9]{3,6}\\b").findAll(it.uppercase()).map(MatchResult::value) }
+            .firstOrNull { token -> token.any(Char::isLetter) && token !in setOf("WIZARDS", "MAGIC", "THE") }
+        return setCode to collector
+    }
+
+    private fun lookupCard(
+        query: String,
+        setCode: String? = null,
+        collectorNumber: String? = null,
+        fromCamera: Boolean = false
+    ) {
         if (query.length < 2 || lookupInFlight) return
         lookupInFlight = true
         lastLookupAt = System.currentTimeMillis()
         runOnUiThread {
             progress.visibility = View.VISIBLE
-            status.text = if (fromCamera) "Recognized “$query”… checking Scryfall" else "Searching…"
+            val printing = if (setCode != null && collectorNumber != null) " ($setCode #$collectorNumber)" else ""
+            status.text = if (fromCamera) "Recognized “$query”$printing… checking Scryfall" else "Searching…"
         }
-        val url = "https://api.scryfall.com/cards/named?fuzzy=${Uri.encode(query)}"
+        val fuzzyUrl = "https://api.scryfall.com/cards/named?fuzzy=${Uri.encode(query)}"
+        val exactUrl = if (setCode != null && collectorNumber != null) {
+            "https://api.scryfall.com/cards/${Uri.encode(setCode.lowercase())}/${Uri.encode(collectorNumber)}"
+        } else null
+        requestCard(exactUrl ?: fuzzyUrl, if (exactUrl != null) fuzzyUrl else null)
+    }
+
+    private fun requestCard(url: String, fallbackUrl: String?) {
         val request = Request.Builder()
             .url(url)
             .header("User-Agent", "BearJ3rksNerdScanner/0.1 (Android)")
@@ -200,8 +261,12 @@ class MainActivity : AppCompatActivity() {
                 response.use {
                     val body = it.body?.string().orEmpty()
                     if (!it.isSuccessful) {
-                        val message = runCatching { JSONObject(body).optString("details") }.getOrNull()
-                        finishLookupError(message ?: "No matching card found")
+                        if (fallbackUrl != null) {
+                            requestCard(fallbackUrl, null)
+                        } else {
+                            val message = runCatching { JSONObject(body).optString("details") }.getOrNull()
+                            finishLookupError(message ?: "No matching card found")
+                        }
                     } else runCatching { JSONObject(body) }
                         .onSuccess { card -> runOnUiThread { showCard(card); finishLookup() } }
                         .onFailure { finishLookupError("Could not read Scryfall's response") }
@@ -218,6 +283,19 @@ class MainActivity : AppCompatActivity() {
             adjustViewBounds = true
             scaleType = ImageView.ScaleType.FIT_CENTER
             imageUris?.optString("normal")?.takeIf { it.isNotBlank() }?.let { load(it) }
+        }
+        scannedBitmap?.let { bitmap ->
+            resultPanel.addView(TextView(this).apply {
+                text = "JUST SCANNED"
+                textSize = 13f
+                gravity = Gravity.CENTER
+                setTextColor(Color.rgb(23, 21, 29))
+            })
+            resultPanel.addView(ImageView(this).apply {
+                adjustViewBounds = true
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                setImageBitmap(bitmap)
+            }, LinearLayout.LayoutParams(-1, dp(170)).apply { bottomMargin = dp(10) })
         }
         val name = card.optString("name", "Unknown card")
         val setName = card.optString("set_name")
@@ -237,9 +315,12 @@ class MainActivity : AppCompatActivity() {
             isEnabled = uri.isNotBlank()
             setOnClickListener { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(uri))) }
         }
-        resultPanel.addView(image, LinearLayout.LayoutParams(-1, dp(360)))
+        resultPanel.addView(image, LinearLayout.LayoutParams(-1, dp(280)))
         resultPanel.addView(info)
-        resultPanel.addView(open)
+        resultPanel.addView(open, LinearLayout.LayoutParams(-1, dp(56)).apply {
+            topMargin = dp(8)
+            bottomMargin = dp(24)
+        })
         getSharedPreferences("recent", MODE_PRIVATE).edit()
             .putString("last_card", name).putString("last_uri", uri).apply()
         status.text = "Match found. Verify the set and collector number before using the price."
