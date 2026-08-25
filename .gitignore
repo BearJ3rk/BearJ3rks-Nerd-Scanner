@@ -9,4 +9,5 @@ captures/
 .cxx/
 *.jks
 *.keystore
+*.p12
 .gh-config/
