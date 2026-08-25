@@ -263,7 +263,7 @@ class MainActivity : AppCompatActivity() {
     private fun requestCard(url: String, fallbackUrl: String?) {
         val request = Request.Builder()
             .url(url)
-            .header("User-Agent", "BearJ3rksNerdScanner/0.1 (Android)")
+            .header("User-Agent", "BearJ3rksNerdScanner/0.2 (Android)")
             .header("Accept", "application/json;q=0.9,*/*;q=0.8")
             .build()
         http.newCall(request).enqueue(object : Callback {
@@ -463,7 +463,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun apiRequest(url: String) = Request.Builder()
         .url(url)
-        .header("User-Agent", "BearJ3rksNerdScanner/0.1 (Android)")
+        .header("User-Agent", "BearJ3rksNerdScanner/0.2 (Android)")
         .header("Accept", "application/json;q=0.9,*/*;q=0.8")
         .build()
 
