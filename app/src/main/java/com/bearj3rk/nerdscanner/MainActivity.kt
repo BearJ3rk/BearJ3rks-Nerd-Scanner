@@ -480,7 +480,7 @@ class MainActivity : AppCompatActivity() {
     private fun showSettings() {
         AlertDialog.Builder(this)
             .setTitle("Update & About")
-            .setMessage("Installed version: ${BuildConfig.VERSION_NAME}\n\nUpdates are securely checked against the public GitHub releases for BearJ3rk's Nerd Scanner.")
+            .setMessage("Installed version: ${installedVersion()}\n\nUpdates are securely checked against the public GitHub releases for BearJ3rk's Nerd Scanner.")
             .setPositiveButton("CHECK FOR UPDATE") { _, _ -> checkForUpdate() }
             .setNegativeButton("CLOSE", null)
             .show()
@@ -523,10 +523,10 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "The latest version could not be identified.", Toast.LENGTH_LONG).show()
             return
         }
-        if (compareVersions(latest, BuildConfig.VERSION_NAME) <= 0) {
+        if (compareVersions(latest, installedVersion()) <= 0) {
             AlertDialog.Builder(this)
                 .setTitle("You're up to date")
-                .setMessage("Version ${BuildConfig.VERSION_NAME} is the newest available version.")
+                .setMessage("Version ${installedVersion()} is the newest available version.")
                 .setPositiveButton("OK", null)
                 .show()
             return
@@ -550,6 +550,9 @@ class MainActivity : AppCompatActivity() {
         }
         return 0
     }
+
+    private fun installedVersion(): String = packageManager
+        .getPackageInfo(packageName, 0).versionName ?: "0.0.0"
 
     private fun finishLookup() { lookupInFlight = false; progress.visibility = View.GONE }
     private fun finishLookupError(message: String) = runOnUiThread {
