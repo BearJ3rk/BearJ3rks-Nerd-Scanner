@@ -87,20 +87,30 @@ class MainActivity : AppCompatActivity() {
             view.setPadding(0, bars.top, 0, bars.bottom + dp(12))
             insets
         }
+        val topBar = FrameLayout(this).apply { setBackgroundColor(Color.rgb(23, 21, 29)) }
         val title = TextView(this).apply {
             text = "BearJ3rk's Nerd Scanner"
             textSize = 24f
             setTextColor(Color.WHITE)
-            setBackgroundColor(Color.rgb(23, 21, 29))
             gravity = Gravity.CENTER
             setPadding(dp(16), dp(18), dp(16), dp(18))
+        }
+        val settings = Button(this).apply {
+            text = "⚙"
+            textSize = 25f
+            contentDescription = "Update and settings"
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.TRANSPARENT)
+            setOnClickListener { showSettings() }
         }
         val tabs = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val scan = Button(this).apply { text = "SCAN CARD"; setOnClickListener { showScanner() } }
         val search = Button(this).apply { text = "SEARCH NAME"; setOnClickListener { showManualSearch() } }
         tabs.addView(scan, LinearLayout.LayoutParams(0, dp(52), 1f))
         tabs.addView(search, LinearLayout.LayoutParams(0, dp(52), 1f))
-        root.addView(title)
+        topBar.addView(title, FrameLayout.LayoutParams(-1, dp(68)))
+        topBar.addView(settings, FrameLayout.LayoutParams(dp(64), dp(68), Gravity.END or Gravity.CENTER_VERTICAL))
+        root.addView(topBar, LinearLayout.LayoutParams(-1, dp(68)))
         root.addView(tabs)
         setContentView(root)
     }
@@ -263,7 +273,7 @@ class MainActivity : AppCompatActivity() {
     private fun requestCard(url: String, fallbackUrl: String?) {
         val request = Request.Builder()
             .url(url)
-            .header("User-Agent", "BearJ3rksNerdScanner/0.2 (Android)")
+            .header("User-Agent", "BearJ3rksNerdScanner/0.2.1 (Android)")
             .header("Accept", "application/json;q=0.9,*/*;q=0.8")
             .build()
         http.newCall(request).enqueue(object : Callback {
@@ -463,9 +473,83 @@ class MainActivity : AppCompatActivity() {
 
     private fun apiRequest(url: String) = Request.Builder()
         .url(url)
-        .header("User-Agent", "BearJ3rksNerdScanner/0.2 (Android)")
+        .header("User-Agent", "BearJ3rksNerdScanner/0.2.1 (Android)")
         .header("Accept", "application/json;q=0.9,*/*;q=0.8")
         .build()
+
+    private fun showSettings() {
+        AlertDialog.Builder(this)
+            .setTitle("Update & About")
+            .setMessage("Installed version: ${BuildConfig.VERSION_NAME}\n\nUpdates are securely checked against the public GitHub releases for BearJ3rk's Nerd Scanner.")
+            .setPositiveButton("CHECK FOR UPDATE") { _, _ -> checkForUpdate() }
+            .setNegativeButton("CLOSE", null)
+            .show()
+    }
+
+    private fun checkForUpdate() {
+        Toast.makeText(this, "Checking GitHub for updates…", Toast.LENGTH_SHORT).show()
+        http.newCall(apiRequest("https://api.github.com/repos/BearJ3rk/BearJ3rks-Nerd-Scanner/releases/latest"))
+            .enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) = runOnUiThread {
+                    Toast.makeText(this@MainActivity, "Update check failed. Try again later.", Toast.LENGTH_LONG).show()
+                }
+                override fun onResponse(call: Call, response: Response) {
+                    response.use {
+                        val release = runCatching { JSONObject(it.body?.string().orEmpty()) }.getOrNull()
+                        if (!it.isSuccessful || release == null) {
+                            runOnUiThread { Toast.makeText(this@MainActivity, "Could not read the latest release.", Toast.LENGTH_LONG).show() }
+                            return
+                        }
+                        val latest = release.optString("tag_name").removePrefix("v").removePrefix("V")
+                        val releasePage = release.optString("html_url")
+                        val assets = release.optJSONArray("assets")
+                        var apkUrl = ""
+                        if (assets != null) for (index in 0 until assets.length()) {
+                            val asset = assets.optJSONObject(index) ?: continue
+                            if (asset.optString("name").endsWith(".apk", ignoreCase = true)) {
+                                apkUrl = asset.optString("browser_download_url")
+                                break
+                            }
+                        }
+                        val target = apkUrl.ifBlank { releasePage }
+                        runOnUiThread { showUpdateResult(latest, target) }
+                    }
+                }
+            })
+    }
+
+    private fun showUpdateResult(latest: String, downloadUrl: String) {
+        if (latest.isBlank()) {
+            Toast.makeText(this, "The latest version could not be identified.", Toast.LENGTH_LONG).show()
+            return
+        }
+        if (compareVersions(latest, BuildConfig.VERSION_NAME) <= 0) {
+            AlertDialog.Builder(this)
+                .setTitle("You're up to date")
+                .setMessage("Version ${BuildConfig.VERSION_NAME} is the newest available version.")
+                .setPositiveButton("OK", null)
+                .show()
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Version $latest available")
+            .setMessage("Download the new APK from the official GitHub release. Android will ask you to approve the installation.")
+            .setPositiveButton("DOWNLOAD UPDATE") { _, _ ->
+                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(downloadUrl)))
+            }
+            .setNegativeButton("LATER", null)
+            .show()
+    }
+
+    private fun compareVersions(left: String, right: String): Int {
+        val a = left.split('.').map { it.takeWhile(Char::isDigit).toIntOrNull() ?: 0 }
+        val b = right.split('.').map { it.takeWhile(Char::isDigit).toIntOrNull() ?: 0 }
+        for (index in 0 until maxOf(a.size, b.size)) {
+            val difference = (a.getOrElse(index) { 0 }).compareTo(b.getOrElse(index) { 0 })
+            if (difference != 0) return difference
+        }
+        return 0
+    }
 
     private fun finishLookup() { lookupInFlight = false; progress.visibility = View.GONE }
     private fun finishLookupError(message: String) = runOnUiThread {
