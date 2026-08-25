@@ -3,7 +3,6 @@ package com.bearj3rk.nerdscanner
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
@@ -57,7 +56,6 @@ class MainActivity : AppCompatActivity() {
     private val http = OkHttpClient.Builder().callTimeout(12, TimeUnit.SECONDS).build()
     private var lastLookupAt = 0L
     private var lookupInFlight = false
-    private var scannedBitmap: Bitmap? = null
     private val setIcons = mutableMapOf<String, String>()
 
     private data class Printing(
@@ -105,8 +103,10 @@ class MainActivity : AppCompatActivity() {
         }
         val tabs = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val scan = Button(this).apply { text = "SCAN CARD"; setOnClickListener { showScanner() } }
+        val cardList = Button(this).apply { text = "MY LIST"; setOnClickListener { showCardList() } }
         val search = Button(this).apply { text = "SEARCH NAME"; setOnClickListener { showManualSearch() } }
         tabs.addView(scan, LinearLayout.LayoutParams(0, dp(52), 1f))
+        tabs.addView(cardList, LinearLayout.LayoutParams(0, dp(52), 1f))
         tabs.addView(search, LinearLayout.LayoutParams(0, dp(52), 1f))
         topBar.addView(title, FrameLayout.LayoutParams(-1, dp(68)))
         topBar.addView(settings, FrameLayout.LayoutParams(dp(64), dp(68), Gravity.END or Gravity.CENTER_VERTICAL))
@@ -126,7 +126,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun showScanner() {
         clearContent()
-        scannedBitmap = null
         previewView = PreviewView(this).apply { scaleType = PreviewView.ScaleType.FILL_CENTER }
         val cameraFrame = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
@@ -167,7 +166,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun showManualSearch() {
         clearContent()
-        scannedBitmap = null
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(18), dp(28), dp(18), dp(18))
@@ -220,7 +218,6 @@ class MainActivity : AppCompatActivity() {
                         val lines = text.textBlocks.flatMap { it.lines }.map { it.text }
                         val candidate = bestCardName(lines)
                         if (candidate != null) {
-                            scannedBitmap = previewView.bitmap
                             val hints = printingHints(lines)
                             lookupCard(candidate, hints.first, hints.second, fromCamera = true)
                         }
@@ -273,7 +270,7 @@ class MainActivity : AppCompatActivity() {
     private fun requestCard(url: String, fallbackUrl: String?) {
         val request = Request.Builder()
             .url(url)
-            .header("User-Agent", "BearJ3rksNerdScanner/0.3 (Android)")
+            .header("User-Agent", "BearJ3rksNerdScanner/0.4 (Android)")
             .header("Accept", "application/json;q=0.9,*/*;q=0.8")
             .build()
         http.newCall(request).enqueue(object : Callback {
@@ -305,19 +302,6 @@ class MainActivity : AppCompatActivity() {
             scaleType = ImageView.ScaleType.FIT_CENTER
             imageUris?.optString("normal")?.takeIf { it.isNotBlank() }?.let { load(it) }
         }
-        scannedBitmap?.let { bitmap ->
-            resultPanel.addView(TextView(this).apply {
-                text = "JUST SCANNED"
-                textSize = 13f
-                gravity = Gravity.CENTER
-                setTextColor(Color.rgb(23, 21, 29))
-            })
-            resultPanel.addView(ImageView(this).apply {
-                adjustViewBounds = true
-                scaleType = ImageView.ScaleType.CENTER_CROP
-                setImageBitmap(bitmap)
-            }, LinearLayout.LayoutParams(-1, dp(170)).apply { bottomMargin = dp(10) })
-        }
         val name = card.optString("name", "Unknown card")
         val setName = card.optString("set_name")
         val number = card.optString("collector_number")
@@ -348,6 +332,13 @@ class MainActivity : AppCompatActivity() {
         }
         resultPanel.addView(image, LinearLayout.LayoutParams(-1, dp(280)))
         resultPanel.addView(info)
+        resultPanel.addView(Button(this).apply {
+            text = "ADD TO MY LIST"
+            setOnClickListener {
+                addCardToList(card)
+                text = "ADD ANOTHER COPY"
+            }
+        }, LinearLayout.LayoutParams(-1, dp(56)).apply { bottomMargin = dp(4) })
         resultPanel.addView(actions, LinearLayout.LayoutParams(-1, dp(56)).apply {
             topMargin = dp(8)
             bottomMargin = dp(24)
@@ -355,6 +346,124 @@ class MainActivity : AppCompatActivity() {
         getSharedPreferences("recent", MODE_PRIVATE).edit()
             .putString("last_card", name).putString("last_uri", uri).apply()
         status.text = "Match found. Verify the set and collector number before using the price."
+    }
+
+    private fun addCardToList(card: JSONObject) {
+        val preferences = getSharedPreferences("card_list", MODE_PRIVATE)
+        val cards = runCatching { org.json.JSONArray(preferences.getString("cards", "[]")) }
+            .getOrElse { org.json.JSONArray() }
+        val id = card.optString("id")
+        var existing: JSONObject? = null
+        for (index in 0 until cards.length()) {
+            val item = cards.optJSONObject(index)
+            if (item?.optString("id") == id) { existing = item; break }
+        }
+        if (existing != null) {
+            existing.put("quantity", existing.optInt("quantity", 1) + 1)
+        } else {
+            val prices = card.optJSONObject("prices")
+            val usd = prices?.optString("usd")?.toDoubleOrNull()
+                ?: prices?.optString("usd_foil")?.toDoubleOrNull() ?: 0.0
+            cards.put(JSONObject().apply {
+                put("id", id)
+                put("name", card.optString("name"))
+                put("set_name", card.optString("set_name"))
+                put("set", card.optString("set").uppercase())
+                put("collector_number", card.optString("collector_number"))
+                put("unit_price", usd)
+                put("quantity", 1)
+                put("scryfall_uri", card.optString("scryfall_uri"))
+            })
+        }
+        preferences.edit().putString("cards", cards.toString()).apply()
+        Toast.makeText(this, "Added to My List", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun showCardList() {
+        clearContent()
+        val preferences = getSharedPreferences("card_list", MODE_PRIVATE)
+        val cards = runCatching { org.json.JSONArray(preferences.getString("cards", "[]")) }
+            .getOrElse { org.json.JSONArray() }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(24))
+        }
+        var total = 0.0
+        for (index in 0 until cards.length()) {
+            val item = cards.optJSONObject(index) ?: continue
+            total += item.optDouble("unit_price", 0.0) * item.optInt("quantity", 1)
+        }
+        container.addView(TextView(this).apply {
+            text = "My Card List\nEstimated total: \$${"%.2f".format(total)}"
+            textSize = 23f
+            gravity = Gravity.CENTER
+            setTextColor(Color.rgb(23, 21, 29))
+            setPadding(0, dp(4), 0, dp(16))
+        })
+        if (cards.length() == 0) {
+            container.addView(TextView(this).apply {
+                text = "Your list is empty. Scan or search for a card, then tap Add to My List."
+                textSize = 17f
+                gravity = Gravity.CENTER
+                setPadding(dp(12), dp(40), dp(12), dp(40))
+            })
+        }
+        for (index in 0 until cards.length()) {
+            val item = cards.optJSONObject(index) ?: continue
+            val quantity = item.optInt("quantity", 1)
+            val unit = item.optDouble("unit_price", 0.0)
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(8), dp(8), dp(4), dp(8))
+            }
+            row.addView(TextView(this).apply {
+                text = "${item.optString("name")}\n${item.optString("set_name")} · ${item.optString("set")} #${item.optString("collector_number")}\n$quantity × \$${"%.2f".format(unit)}  =  \$${"%.2f".format(unit * quantity)}"
+                textSize = 16f
+                setTextColor(Color.rgb(23, 21, 29))
+                setOnClickListener {
+                    val uri = item.optString("scryfall_uri")
+                    if (uri.isNotBlank()) startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(uri)))
+                }
+            }, LinearLayout.LayoutParams(0, -2, 1f))
+            row.addView(Button(this).apply {
+                text = "−1"
+                contentDescription = "Remove one ${item.optString("name")}"
+                setOnClickListener { removeOneFromList(item.optString("id")) }
+            }, LinearLayout.LayoutParams(dp(64), dp(50)))
+            container.addView(row, LinearLayout.LayoutParams(-1, -2))
+        }
+        if (cards.length() > 0) container.addView(Button(this).apply {
+            text = "CLEAR LIST"
+            setOnClickListener {
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("Clear My List?")
+                    .setMessage("This removes every saved card from the list.")
+                    .setPositiveButton("CLEAR") { _, _ ->
+                        preferences.edit().remove("cards").apply()
+                        showCardList()
+                    }
+                    .setNegativeButton("CANCEL", null)
+                    .show()
+            }
+        })
+        root.addView(ScrollView(this).apply { addView(container) }, LinearLayout.LayoutParams(-1, 0, 1f))
+    }
+
+    private fun removeOneFromList(id: String) {
+        val preferences = getSharedPreferences("card_list", MODE_PRIVATE)
+        val cards = runCatching { org.json.JSONArray(preferences.getString("cards", "[]")) }
+            .getOrElse { org.json.JSONArray() }
+        val updated = org.json.JSONArray()
+        for (index in 0 until cards.length()) {
+            val item = cards.optJSONObject(index) ?: continue
+            if (item.optString("id") == id) {
+                val quantity = item.optInt("quantity", 1) - 1
+                if (quantity > 0) { item.put("quantity", quantity); updated.put(item) }
+            } else updated.put(item)
+        }
+        preferences.edit().putString("cards", updated.toString()).apply()
+        showCardList()
     }
 
     private fun loadPrintings(card: JSONObject) {
@@ -473,7 +582,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun apiRequest(url: String) = Request.Builder()
         .url(url)
-        .header("User-Agent", "BearJ3rksNerdScanner/0.3 (Android)")
+        .header("User-Agent", "BearJ3rksNerdScanner/0.4 (Android)")
         .header("Accept", "application/json;q=0.9,*/*;q=0.8")
         .build()
 
