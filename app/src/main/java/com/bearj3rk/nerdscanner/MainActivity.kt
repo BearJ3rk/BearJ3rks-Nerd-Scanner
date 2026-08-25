@@ -22,6 +22,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
@@ -57,6 +58,14 @@ class MainActivity : AppCompatActivity() {
     private var lastLookupAt = 0L
     private var lookupInFlight = false
     private var scannedBitmap: Bitmap? = null
+    private val setIcons = mutableMapOf<String, String>()
+
+    private data class Printing(
+        val id: String,
+        val setCode: String,
+        val setName: String,
+        val collectorNumber: String
+    )
 
     private val cameraPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) startCamera() else status.text = "Camera permission denied. Manual search still works."
@@ -107,6 +116,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun showScanner() {
         clearContent()
+        scannedBitmap = null
         previewView = PreviewView(this).apply { scaleType = PreviewView.ScaleType.FILL_CENTER }
         val cameraFrame = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
@@ -147,6 +157,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun showManualSearch() {
         clearContent()
+        scannedBitmap = null
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(18), dp(28), dp(18), dp(18))
@@ -315,9 +326,19 @@ class MainActivity : AppCompatActivity() {
             isEnabled = uri.isNotBlank()
             setOnClickListener { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(uri))) }
         }
+        val changeSet = Button(this).apply {
+            text = "CHANGE SET"
+            isEnabled = card.optString("prints_search_uri").isNotBlank()
+            setOnClickListener { loadPrintings(card) }
+        }
+        val actions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(open, LinearLayout.LayoutParams(0, dp(56), 1f).apply { marginEnd = dp(4) })
+            addView(changeSet, LinearLayout.LayoutParams(0, dp(56), 1f).apply { marginStart = dp(4) })
+        }
         resultPanel.addView(image, LinearLayout.LayoutParams(-1, dp(280)))
         resultPanel.addView(info)
-        resultPanel.addView(open, LinearLayout.LayoutParams(-1, dp(56)).apply {
+        resultPanel.addView(actions, LinearLayout.LayoutParams(-1, dp(56)).apply {
             topMargin = dp(8)
             bottomMargin = dp(24)
         })
@@ -325,6 +346,126 @@ class MainActivity : AppCompatActivity() {
             .putString("last_card", name).putString("last_uri", uri).apply()
         status.text = "Match found. Verify the set and collector number before using the price."
     }
+
+    private fun loadPrintings(card: JSONObject) {
+        val uri = card.optString("prints_search_uri")
+        if (uri.isBlank() || lookupInFlight) return
+        lookupInFlight = true
+        progress.visibility = View.VISIBLE
+        status.text = "Loading available sets…"
+        fetchPrintingPage(uri, mutableListOf()) { printings ->
+            if (printings.isEmpty()) {
+                finishLookupError("No alternate printings found")
+            } else ensureSetIcons {
+                runOnUiThread {
+                    finishLookup()
+                    showPrintingDialog(printings)
+                    status.text = "Choose the set and printing you want."
+                }
+            }
+        }
+    }
+
+    private fun fetchPrintingPage(
+        url: String,
+        collected: MutableList<Printing>,
+        done: (List<Printing>) -> Unit
+    ) {
+        val request = apiRequest(url)
+        http.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) = finishLookupError("Could not load printings")
+            override fun onResponse(call: Call, response: Response) {
+                response.use {
+                    if (!it.isSuccessful) { finishLookupError("Could not load printings"); return }
+                    val json = runCatching { JSONObject(it.body?.string().orEmpty()) }.getOrNull()
+                    if (json == null) { finishLookupError("Could not read printings"); return }
+                    val data = json.optJSONArray("data")
+                    if (data != null) for (index in 0 until data.length()) {
+                        val item = data.optJSONObject(index) ?: continue
+                        collected += Printing(
+                            item.optString("id"), item.optString("set"),
+                            item.optString("set_name"), item.optString("collector_number")
+                        )
+                    }
+                    val next = json.optString("next_page")
+                    if (json.optBoolean("has_more") && next.isNotBlank()) fetchPrintingPage(next, collected, done)
+                    else done(collected.distinctBy { printing -> printing.id })
+                }
+            }
+        })
+    }
+
+    private fun ensureSetIcons(done: () -> Unit) {
+        if (setIcons.isNotEmpty()) { done(); return }
+        http.newCall(apiRequest("https://api.scryfall.com/sets")).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) = done()
+            override fun onResponse(call: Call, response: Response) {
+                response.use {
+                    val data = runCatching { JSONObject(it.body?.string().orEmpty()).optJSONArray("data") }.getOrNull()
+                    if (data != null) for (index in 0 until data.length()) {
+                        val set = data.optJSONObject(index) ?: continue
+                        setIcons[set.optString("code")] = set.optString("icon_svg_uri")
+                    }
+                    done()
+                }
+            }
+        })
+    }
+
+    private fun showPrintingDialog(printings: List<Printing>) {
+        val list = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(8), dp(4), dp(8), dp(8))
+        }
+        val scroll = ScrollView(this).apply { addView(list) }
+        lateinit var dialog: AlertDialog
+        dialog = AlertDialog.Builder(this)
+            .setTitle("Change set / printing")
+            .setView(scroll)
+            .setNegativeButton("CANCEL", null)
+            .create()
+        printings.forEach { printing ->
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                isClickable = true
+                isFocusable = true
+                setPadding(dp(10), dp(8), dp(10), dp(8))
+                background = resources.getDrawable(android.R.drawable.list_selector_background, theme)
+            }
+            val icon = ImageView(this).apply {
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                setIcons[printing.setCode]?.takeIf(String::isNotBlank)?.let { load(it) }
+            }
+            val label = TextView(this).apply {
+                text = "${printing.setName}\n${printing.setCode.uppercase()} · #${printing.collectorNumber}"
+                textSize = 16f
+                setTextColor(Color.rgb(23, 21, 29))
+                setPadding(dp(12), dp(2), dp(4), dp(2))
+            }
+            row.addView(icon, LinearLayout.LayoutParams(dp(42), dp(42)))
+            row.addView(label, LinearLayout.LayoutParams(0, -2, 1f))
+            row.setOnClickListener {
+                dialog.dismiss()
+                lookupPrinting(printing.id)
+            }
+            list.addView(row, LinearLayout.LayoutParams(-1, dp(62)))
+        }
+        dialog.show()
+    }
+
+    private fun lookupPrinting(id: String) {
+        lookupInFlight = true
+        progress.visibility = View.VISIBLE
+        status.text = "Loading selected printing…"
+        requestCard("https://api.scryfall.com/cards/${Uri.encode(id)}", null)
+    }
+
+    private fun apiRequest(url: String) = Request.Builder()
+        .url(url)
+        .header("User-Agent", "BearJ3rksNerdScanner/0.1 (Android)")
+        .header("Accept", "application/json;q=0.9,*/*;q=0.8")
+        .build()
 
     private fun finishLookup() { lookupInFlight = false; progress.visibility = View.GONE }
     private fun finishLookupError(message: String) = runOnUiThread {
