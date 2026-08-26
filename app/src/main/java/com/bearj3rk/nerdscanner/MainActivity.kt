@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.graphics.Bitmap
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
@@ -12,6 +13,8 @@ import android.view.Gravity
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.widget.Button
+import android.widget.ArrayAdapter
+import android.widget.Spinner
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -29,9 +32,14 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
+import androidx.core.graphics.drawable.toBitmap
+import androidx.lifecycle.lifecycleScope
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import coil.load
+import coil.ImageLoader
+import coil.decode.SvgDecoder
+import coil.request.ImageRequest
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
@@ -41,9 +49,13 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import org.json.JSONObject
+import org.json.JSONArray
 import java.io.IOException
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlin.math.sqrt
 
 class MainActivity : AppCompatActivity() {
     private lateinit var root: LinearLayout
@@ -57,6 +69,7 @@ class MainActivity : AppCompatActivity() {
     private var lastLookupAt = 0L
     private var lookupInFlight = false
     private val setIcons = mutableMapOf<String, String>()
+    @Volatile private var pendingSetSymbol: Bitmap? = null
 
     private data class Printing(
         val id: String,
@@ -219,7 +232,10 @@ class MainActivity : AppCompatActivity() {
                         val candidate = bestCardName(lines)
                         if (candidate != null) {
                             val hints = printingHints(lines)
-                            lookupCard(candidate, hints.first, hints.second, fromCamera = true)
+                            runOnUiThread {
+                                pendingSetSymbol = captureSetSymbol()
+                                lookupCard(candidate, hints.first, hints.second, fromCamera = true)
+                            }
                         }
                     }
                     .addOnCompleteListener { proxy.close() }
@@ -227,6 +243,20 @@ class MainActivity : AppCompatActivity() {
             provider.unbindAll()
             provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
         }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun captureSetSymbol(): Bitmap? {
+        val frame = previewView.bitmap ?: return null
+        // Most modern cards place the expansion mark at the right edge, just below center.
+        val cardWidth = frame.width * 0.61f
+        val cardHeight = frame.height * 0.85f
+        val cardLeft = (frame.width - cardWidth) / 2f
+        val cardTop = (frame.height - cardHeight) / 2f
+        val left = (cardLeft + cardWidth * 0.73f).toInt().coerceIn(0, frame.width - 2)
+        val top = (cardTop + cardHeight * 0.47f).toInt().coerceIn(0, frame.height - 2)
+        val width = (cardWidth * 0.22f).toInt().coerceAtMost(frame.width - left).coerceAtLeast(1)
+        val height = (cardHeight * 0.13f).toInt().coerceAtMost(frame.height - top).coerceAtLeast(1)
+        return runCatching { Bitmap.createBitmap(frame, left, top, width, height) }.getOrNull()
     }
 
     private fun bestCardName(lines: List<String>): String? = lines
@@ -270,7 +300,7 @@ class MainActivity : AppCompatActivity() {
     private fun requestCard(url: String, fallbackUrl: String?) {
         val request = Request.Builder()
             .url(url)
-            .header("User-Agent", "BearJ3rksNerdScanner/0.4.1 (Android)")
+            .header("User-Agent", "BearJ3rksNerdScanner/0.5 (Android)")
             .header("Accept", "application/json;q=0.9,*/*;q=0.8")
             .build()
         http.newCall(request).enqueue(object : Callback {
@@ -346,60 +376,97 @@ class MainActivity : AppCompatActivity() {
         getSharedPreferences("recent", MODE_PRIVATE).edit()
             .putString("last_card", name).putString("last_uri", uri).apply()
         status.text = "Match found. Verify the set and collector number before using the price."
+        pendingSetSymbol?.let { symbol ->
+            pendingSetSymbol = null
+            matchSetSymbol(card, symbol)
+        }
     }
 
     private fun addCardToList(card: JSONObject) {
+        val prices = card.optJSONObject("prices")
+        val choices = mutableListOf<Pair<String, Double>>()
+        prices?.optString("usd")?.takeUnless { it.isBlank() || it == "null" }?.toDoubleOrNull()?.let { choices += "Non-foil" to it }
+        prices?.optString("usd_foil")?.takeUnless { it.isBlank() || it == "null" }?.toDoubleOrNull()?.let { choices += "Foil" to it }
+        if (choices.isEmpty()) choices += "Non-foil (price unavailable)" to 0.0
+        if (choices.size == 1) addCardWithFinish(card, choices.first().first.substringBefore(" ").lowercase(), choices.first().second)
+        else AlertDialog.Builder(this)
+            .setTitle("Choose card finish")
+            .setItems(choices.map { "${it.first} — \$${"%.2f".format(it.second)}" }.toTypedArray()) { _, which ->
+                addCardWithFinish(card, choices[which].first.lowercase(), choices[which].second)
+            }.setNegativeButton("CANCEL", null).show()
+    }
+
+    private fun loadLists(): JSONObject {
         val preferences = getSharedPreferences("card_list", MODE_PRIVATE)
-        val cards = runCatching { org.json.JSONArray(preferences.getString("cards", "[]")) }
-            .getOrElse { org.json.JSONArray() }
+        val saved = preferences.getString("lists", null)
+        if (saved != null) return runCatching { JSONObject(saved) }.getOrElse { JSONObject().put("My List", JSONArray()) }
+        val oldCards = runCatching { JSONArray(preferences.getString("cards", "[]")) }.getOrElse { JSONArray() }
+        for (index in 0 until oldCards.length()) oldCards.optJSONObject(index)?.put("finish", "non-foil")
+        return JSONObject().put("My List", oldCards).also {
+            preferences.edit().putString("lists", it.toString()).putString("active_list", "My List").remove("cards").apply()
+        }
+    }
+
+    private fun saveLists(lists: JSONObject) = getSharedPreferences("card_list", MODE_PRIVATE)
+        .edit().putString("lists", lists.toString()).apply()
+
+    private fun activeListName(lists: JSONObject): String {
+        val preferences = getSharedPreferences("card_list", MODE_PRIVATE)
+        val requested = preferences.getString("active_list", "My List") ?: "My List"
+        if (lists.has(requested)) return requested
+        return lists.keys().asSequence().firstOrNull() ?: "My List"
+    }
+
+    private fun addCardWithFinish(card: JSONObject, finish: String, unitPrice: Double) {
+        val lists = loadLists()
+        val listName = activeListName(lists)
+        val cards = lists.optJSONArray(listName) ?: JSONArray().also { lists.put(listName, it) }
         val id = card.optString("id")
         var existing: JSONObject? = null
         for (index in 0 until cards.length()) {
-            val item = cards.optJSONObject(index)
-            if (item?.optString("id") == id) { existing = item; break }
+            cards.optJSONObject(index)?.takeIf { it.optString("id") == id && it.optString("finish", "non-foil") == finish }?.let { existing = it }
         }
-        if (existing != null) {
-            existing.put("quantity", existing.optInt("quantity", 1) + 1)
-        } else {
-            val prices = card.optJSONObject("prices")
-            val usd = prices?.optString("usd")?.toDoubleOrNull()
-                ?: prices?.optString("usd_foil")?.toDoubleOrNull() ?: 0.0
-            cards.put(JSONObject().apply {
-                put("id", id)
-                put("name", card.optString("name"))
-                put("set_name", card.optString("set_name"))
-                put("set", card.optString("set").uppercase())
-                put("collector_number", card.optString("collector_number"))
-                put("unit_price", usd)
-                put("quantity", 1)
-                put("scryfall_uri", card.optString("scryfall_uri"))
-            })
-        }
-        preferences.edit().putString("cards", cards.toString()).apply()
-        Toast.makeText(this, "Added to My List", Toast.LENGTH_SHORT).show()
+        if (existing != null) existing!!.put("quantity", existing!!.optInt("quantity", 1) + 1)
+        else cards.put(JSONObject().apply {
+            put("id", id); put("name", card.optString("name")); put("set_name", card.optString("set_name"))
+            put("set", card.optString("set").uppercase()); put("collector_number", card.optString("collector_number"))
+            put("finish", finish); put("unit_price", unitPrice); put("quantity", 1)
+            put("scryfall_uri", card.optString("scryfall_uri"))
+        })
+        saveLists(lists)
+        Toast.makeText(this, "Added ${finish.replaceFirstChar(Char::uppercase)} to $listName", Toast.LENGTH_SHORT).show()
     }
 
     private fun showCardList() {
         clearContent()
         val preferences = getSharedPreferences("card_list", MODE_PRIVATE)
-        val cards = runCatching { org.json.JSONArray(preferences.getString("cards", "[]")) }
-            .getOrElse { org.json.JSONArray() }
+        val lists = loadLists()
+        val listName = activeListName(lists)
+        val cards = lists.optJSONArray(listName) ?: JSONArray()
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(16), dp(16), dp(24))
         }
-        var total = 0.0
-        for (index in 0 until cards.length()) {
-            val item = cards.optJSONObject(index) ?: continue
-            total += item.optDouble("unit_price", 0.0) * item.optInt("quantity", 1)
+        val names = lists.keys().asSequence().toList()
+        val selector = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, names)
+            setSelection(names.indexOf(listName).coerceAtLeast(0))
         }
-        container.addView(TextView(this).apply {
-            text = "My Card List\nEstimated total: \$${"%.2f".format(total)}"
-            textSize = 23f
-            gravity = Gravity.CENTER
-            setTextColor(Color.rgb(23, 21, 29))
-            setPadding(0, dp(4), 0, dp(16))
-        })
+        var initialSelection = true
+        selector.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) = Unit
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
+                if (initialSelection) { initialSelection = false; return }
+                preferences.edit().putString("active_list", names[position]).apply(); showCardList()
+            }
+        }
+        val listHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(selector, LinearLayout.LayoutParams(0, dp(56), 1f))
+            addView(Button(this@MainActivity).apply { text = "NEW LIST"; setOnClickListener { createNewList() } }, LinearLayout.LayoutParams(dp(120), dp(56)))
+        }
+        container.addView(TextView(this).apply { text = "My Lists"; textSize = 23f; gravity = Gravity.CENTER })
+        container.addView(listHeader)
         if (cards.length() == 0) {
             container.addView(TextView(this).apply {
                 text = "Your list is empty. Scan or search for a card, then tap Add to My List."
@@ -418,7 +485,7 @@ class MainActivity : AppCompatActivity() {
                 setPadding(dp(8), dp(8), dp(4), dp(8))
             }
             row.addView(TextView(this).apply {
-                text = "${item.optString("name")}\n${item.optString("set_name")} · ${item.optString("set")} #${item.optString("collector_number")}\n$quantity × \$${"%.2f".format(unit)}  =  \$${"%.2f".format(unit * quantity)}"
+                text = "${item.optString("name")} (${item.optString("finish", "non-foil").replaceFirstChar(Char::uppercase)})\n${item.optString("set_name")} · ${item.optString("set")} #${item.optString("collector_number")}\n$quantity × \$${"%.2f".format(unit)}  =  \$${"%.2f".format(unit * quantity)}"
                 textSize = 16f
                 setTextColor(Color.rgb(23, 21, 29))
                 setOnClickListener {
@@ -429,10 +496,21 @@ class MainActivity : AppCompatActivity() {
             row.addView(Button(this).apply {
                 text = "−1"
                 contentDescription = "Remove one ${item.optString("name")}"
-                setOnClickListener { removeOneFromList(item.optString("id")) }
-            }, LinearLayout.LayoutParams(dp(64), dp(50)))
+                setOnClickListener { adjustListQuantity(item.optString("id"), item.optString("finish", "non-foil"), -1) }
+            }, LinearLayout.LayoutParams(dp(60), dp(50)))
+            row.addView(Button(this).apply {
+                text = "+1"
+                contentDescription = "Add one ${item.optString("name")}"
+                setOnClickListener { adjustListQuantity(item.optString("id"), item.optString("finish", "non-foil"), 1) }
+            }, LinearLayout.LayoutParams(dp(60), dp(50)))
             container.addView(row, LinearLayout.LayoutParams(-1, -2))
         }
+        var total = 0.0
+        for (index in 0 until cards.length()) cards.optJSONObject(index)?.let { total += it.optDouble("unit_price", 0.0) * it.optInt("quantity", 1) }
+        container.addView(TextView(this).apply {
+            text = "Estimated total: \$${"%.2f".format(total)}"
+            textSize = 23f; gravity = Gravity.CENTER; setTextColor(Color.rgb(23, 21, 29)); setPadding(0, dp(20), 0, dp(12))
+        })
         if (cards.length() > 0) container.addView(Button(this).apply {
             text = "CLEAR LIST"
             setOnClickListener {
@@ -440,7 +518,7 @@ class MainActivity : AppCompatActivity() {
                     .setTitle("Clear My List?")
                     .setMessage("This removes every saved card from the list.")
                     .setPositiveButton("CLEAR") { _, _ ->
-                        preferences.edit().remove("cards").apply()
+                        lists.put(listName, JSONArray()); saveLists(lists)
                         showCardList()
                     }
                     .setNegativeButton("CANCEL", null)
@@ -450,20 +528,31 @@ class MainActivity : AppCompatActivity() {
         root.addView(ScrollView(this).apply { addView(container) }, LinearLayout.LayoutParams(-1, 0, 1f))
     }
 
-    private fun removeOneFromList(id: String) {
-        val preferences = getSharedPreferences("card_list", MODE_PRIVATE)
-        val cards = runCatching { org.json.JSONArray(preferences.getString("cards", "[]")) }
-            .getOrElse { org.json.JSONArray() }
-        val updated = org.json.JSONArray()
+    private fun adjustListQuantity(id: String, finish: String, delta: Int) {
+        val lists = loadLists(); val listName = activeListName(lists)
+        val cards = lists.optJSONArray(listName) ?: JSONArray(); val updated = JSONArray()
         for (index in 0 until cards.length()) {
             val item = cards.optJSONObject(index) ?: continue
-            if (item.optString("id") == id) {
-                val quantity = item.optInt("quantity", 1) - 1
+            if (item.optString("id") == id && item.optString("finish", "non-foil") == finish) {
+                val quantity = item.optInt("quantity", 1) + delta
                 if (quantity > 0) { item.put("quantity", quantity); updated.put(item) }
             } else updated.put(item)
         }
-        preferences.edit().putString("cards", updated.toString()).apply()
-        showCardList()
+        lists.put(listName, updated); saveLists(lists); showCardList()
+    }
+
+    private fun createNewList() {
+        val input = EditText(this).apply { hint = "List name"; inputType = InputType.TYPE_CLASS_TEXT; setSingleLine(true) }
+        AlertDialog.Builder(this).setTitle("Create a new list").setView(input)
+            .setPositiveButton("CREATE") { _, _ ->
+                val name = input.text.toString().trim()
+                if (name.isBlank()) return@setPositiveButton
+                val lists = loadLists()
+                if (!lists.has(name)) lists.put(name, JSONArray())
+                saveLists(lists)
+                getSharedPreferences("card_list", MODE_PRIVATE).edit().putString("active_list", name).apply()
+                showCardList()
+            }.setNegativeButton("CANCEL", null).show()
     }
 
     private fun loadPrintings(card: JSONObject) {
@@ -554,7 +643,9 @@ class MainActivity : AppCompatActivity() {
             }
             val icon = ImageView(this).apply {
                 scaleType = ImageView.ScaleType.FIT_CENTER
-                setIcons[printing.setCode]?.takeIf(String::isNotBlank)?.let { load(it) }
+                setIcons[printing.setCode]?.takeIf(String::isNotBlank)?.let { url ->
+                    load(url) { decoderFactory(SvgDecoder.Factory()) }
+                }
             }
             val label = TextView(this).apply {
                 text = "${printing.setName}\n${printing.setCode.uppercase()} · #${printing.collectorNumber}"
@@ -573,6 +664,61 @@ class MainActivity : AppCompatActivity() {
         dialog.show()
     }
 
+    private fun matchSetSymbol(card: JSONObject, scanned: Bitmap) {
+        val uri = card.optString("prints_search_uri")
+        if (uri.isBlank()) return
+        status.text = "Card recognized. Comparing the photographed set symbol…"
+        fetchPrintingPage(uri, mutableListOf()) { printings ->
+            ensureSetIcons {
+                lifecycleScope.launch(Dispatchers.IO) {
+                    val loader = ImageLoader.Builder(this@MainActivity).components { add(SvgDecoder.Factory()) }.build()
+                    val scored = printings.distinctBy { it.setCode }.mapNotNull { printing ->
+                        val iconUrl = setIcons[printing.setCode].orEmpty()
+                        if (iconUrl.isBlank()) return@mapNotNull null
+                        val drawable = runCatching {
+                            loader.execute(ImageRequest.Builder(this@MainActivity).data(iconUrl).size(64).build()).drawable
+                        }.getOrNull() ?: return@mapNotNull null
+                        printing to symbolSimilarity(scanned, drawable.toBitmap(64, 64))
+                    }.sortedByDescending { it.second }
+                    val best = scored.firstOrNull()
+                    val runnerUp = scored.getOrNull(1)?.second ?: 0.0
+                    runOnUiThread {
+                        if (best != null && best.second >= 0.52 && best.second - runnerUp >= 0.035) {
+                            status.text = "Set symbol likely matches ${best.first.setName}. Loading that printing…"
+                            lookupPrinting(best.first.id)
+                        } else {
+                            status.text = "Card found, but the set symbol was not clear enough to select automatically. Tap Change Set to verify it."
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun symbolSimilarity(left: Bitmap, right: Bitmap): Double {
+        fun signature(source: Bitmap): DoubleArray {
+            val bitmap = Bitmap.createScaledBitmap(source, 32, 32, true)
+            val gray = DoubleArray(32 * 32)
+            for (y in 0 until 32) for (x in 0 until 32) {
+                val pixel = bitmap.getPixel(x, y)
+                gray[y * 32 + x] = (Color.red(pixel) * .299 + Color.green(pixel) * .587 + Color.blue(pixel) * .114) / 255.0
+            }
+            val edges = DoubleArray(30 * 30)
+            var position = 0
+            for (y in 1 until 31) for (x in 1 until 31) {
+                val dx = gray[y * 32 + x + 1] - gray[y * 32 + x - 1]
+                val dy = gray[(y + 1) * 32 + x] - gray[(y - 1) * 32 + x]
+                edges[position++] = sqrt(dx * dx + dy * dy)
+            }
+            val mean = edges.average()
+            return DoubleArray(edges.size) { edges[it] - mean }
+        }
+        val a = signature(left); val b = signature(right)
+        var dot = 0.0; var aa = 0.0; var bb = 0.0
+        for (index in a.indices) { dot += a[index] * b[index]; aa += a[index] * a[index]; bb += b[index] * b[index] }
+        return if (aa == 0.0 || bb == 0.0) 0.0 else dot / sqrt(aa * bb)
+    }
+
     private fun lookupPrinting(id: String) {
         lookupInFlight = true
         progress.visibility = View.VISIBLE
@@ -582,7 +728,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun apiRequest(url: String) = Request.Builder()
         .url(url)
-        .header("User-Agent", "BearJ3rksNerdScanner/0.4.1 (Android)")
+        .header("User-Agent", "BearJ3rksNerdScanner/0.5 (Android)")
         .header("Accept", "application/json;q=0.9,*/*;q=0.8")
         .build()
 
