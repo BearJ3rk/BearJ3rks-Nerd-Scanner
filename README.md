@@ -1,8 +1,8 @@
-# BearJ3rk's Nerd Scanner V0.7
+# BearJ3rk's Nerd Scanner V0.8
 
 An Android app that scans Magic: The Gathering cards, looks them up on Scryfall, displays current printing prices, and opens the matching Scryfall page. It also supports manual fuzzy search by card name.
 
-## V0.7 features
+## V0.8 features
 
 - Camera scanning with on-device ML Kit OCR
 - Manual card-name search
@@ -19,6 +19,8 @@ An Android app that scans Magic: The Gathering cards, looks them up on Scryfall,
 - More compact camera and result layout with resilient matched-card images
 - Artwork-based printing guesses using cached Scryfall image fingerprints
 - Automatic 300-entry artwork cache with a Settings option to clear it
+- Identified Scryfall artwork requests with alternate-image fallbacks and visible errors
+- Persistent 100 MB HTTP image cache shared by card display and artwork matching
 
 OCR provides a likely card-name match. Always verify the displayed set and collector number, especially for cards with many printings.
 
