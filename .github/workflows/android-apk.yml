@@ -35,6 +35,6 @@ jobs:
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
       - uses: actions/upload-artifact@v4
         with:
-          name: BearJ3rks-Nerd-Scanner-V0.7
+          name: BearJ3rks-Nerd-Scanner-V0.8
           path: app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
