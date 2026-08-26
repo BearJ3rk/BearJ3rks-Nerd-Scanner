@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
@@ -32,18 +33,16 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
-import androidx.core.graphics.drawable.toBitmap
 import androidx.lifecycle.lifecycleScope
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import coil.load
-import coil.ImageLoader
 import coil.decode.SvgDecoder
-import coil.request.ImageRequest
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import okhttp3.Call
+import okhttp3.Cache
 import okhttp3.Callback
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -51,6 +50,7 @@ import okhttp3.Response
 import org.json.JSONObject
 import org.json.JSONArray
 import java.io.IOException
+import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
@@ -65,7 +65,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var progress: ProgressBar
     private val cameraExecutor = Executors.newSingleThreadExecutor()
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-    private val http = OkHttpClient.Builder().callTimeout(12, TimeUnit.SECONDS).build()
+    private val http by lazy {
+        OkHttpClient.Builder()
+            .cache(Cache(File(cacheDir, "scryfall_http_cache"), 100L * 1024L * 1024L))
+            .callTimeout(15, TimeUnit.SECONDS)
+            .build()
+    }
     private var lastLookupAt = 0L
     private var lookupInFlight = false
     private val setIcons = mutableMapOf<String, String>()
@@ -302,7 +307,7 @@ class MainActivity : AppCompatActivity() {
     private fun requestCard(url: String, fallbackUrl: String?) {
         val request = Request.Builder()
             .url(url)
-            .header("User-Agent", "BearJ3rksNerdScanner/0.7 (Android)")
+            .header("User-Agent", "BearJ3rksNerdScanner/0.8 (Android)")
             .header("Accept", "application/json;q=0.9,*/*;q=0.8")
             .build()
         http.newCall(request).enqueue(object : Callback {
@@ -331,18 +336,16 @@ class MainActivity : AppCompatActivity() {
 
     private fun showCard(card: JSONObject) {
         resultPanel.removeAllViews()
-        val imageUrl = cardImageUrl(card)
+        val imageUrls = cardImageUrls(card)
         val image = ImageView(this).apply {
             adjustViewBounds = true
             scaleType = ImageView.ScaleType.FIT_CENTER
             contentDescription = "Matched Magic card image"
             setBackgroundColor(Color.rgb(231, 225, 214))
-            if (imageUrl != null) load(imageUrl) {
-                crossfade(true)
-                placeholder(android.R.drawable.ic_menu_gallery)
-                error(android.R.drawable.ic_dialog_alert)
-            } else setImageResource(android.R.drawable.ic_dialog_alert)
+            setImageResource(android.R.drawable.ic_menu_gallery)
         }
+        if (imageUrls.isNotEmpty()) loadCardImage(image, imageUrls)
+        else image.setImageResource(android.R.drawable.ic_dialog_alert)
         val name = card.optString("name", "Unknown card")
         val setName = card.optString("set_name")
         val number = card.optString("collector_number")
@@ -400,19 +403,40 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun cardImageUrl(card: JSONObject): String? {
-        fun fromUris(uris: JSONObject?): String? {
-            if (uris == null) return null
+    private fun cardImageUrls(card: JSONObject): List<String> {
+        fun fromUris(uris: JSONObject?): List<String> {
+            if (uris == null) return emptyList()
             return listOf("normal", "large", "small", "png", "art_crop")
-                .asSequence().map { uris.optString(it) }
-                .firstOrNull { it.startsWith("https://") }
+                .map { uris.optString(it) }.filter { it.startsWith("https://") }
         }
-        fromUris(card.optJSONObject("image_uris"))?.let { return it }
-        val faces = card.optJSONArray("card_faces") ?: return null
+        val urls = fromUris(card.optJSONObject("image_uris")).toMutableList()
+        val faces = card.optJSONArray("card_faces") ?: return urls.distinct()
         for (index in 0 until faces.length()) {
-            fromUris(faces.optJSONObject(index)?.optJSONObject("image_uris"))?.let { return it }
+            urls += fromUris(faces.optJSONObject(index)?.optJSONObject("image_uris"))
         }
-        return null
+        return urls.distinct()
+    }
+
+    private fun loadCardImage(view: ImageView, urls: List<String>, index: Int = 0, lastError: String = "") {
+        if (index >= urls.size) {
+            runOnUiThread {
+                view.setImageResource(android.R.drawable.ic_dialog_alert)
+                view.contentDescription = "Card artwork failed to load${if (lastError.isBlank()) "" else ": $lastError"}"
+                Toast.makeText(this, "Card details loaded, but the artwork download failed${if (lastError.isBlank()) "." else ": $lastError"}", Toast.LENGTH_LONG).show()
+            }
+            return
+        }
+        http.newCall(imageRequest(urls[index])).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) = loadCardImage(view, urls, index + 1, e.localizedMessage ?: "network error")
+            override fun onResponse(call: Call, response: Response) {
+                response.use {
+                    val bytes = if (it.isSuccessful) it.body?.bytes() else null
+                    val bitmap = bytes?.let { data -> BitmapFactory.decodeByteArray(data, 0, data.size) }
+                    if (bitmap == null) loadCardImage(view, urls, index + 1, "HTTP ${it.code}")
+                    else runOnUiThread { if (view.isAttachedToWindow) view.setImageBitmap(bitmap) }
+                }
+            }
+        })
     }
 
     private fun addCardToList(card: JSONObject) {
@@ -718,13 +742,10 @@ class MainActivity : AppCompatActivity() {
         fetchPrintingPage(uri, mutableListOf()) { printings ->
             lifecycleScope.launch(Dispatchers.IO) {
                 val photographedSignature = artworkSignature(photographedArt)
-                val loader = ImageLoader(this@MainActivity)
                 val scored = printings.filter { it.artUrl.isNotBlank() }.distinctBy { it.artUrl }.mapNotNull { printing ->
                     val referenceSignature = cachedArtworkSignature(printing.id) ?: run {
-                        val drawable = runCatching {
-                            loader.execute(ImageRequest.Builder(this@MainActivity).data(printing.artUrl).size(192, 140).build()).drawable
-                        }.getOrNull() ?: return@mapNotNull null
-                        artworkSignature(drawable.toBitmap(192, 140)).also { cacheArtworkSignature(printing.id, it) }
+                        val bitmap = downloadBitmap(printing.artUrl) ?: return@mapNotNull null
+                        artworkSignature(bitmap).also { cacheArtworkSignature(printing.id, it) }
                     }
                     printing to artworkSimilarity(photographedSignature, referenceSignature)
                 }.sortedByDescending { it.second }
@@ -792,6 +813,20 @@ class MainActivity : AppCompatActivity() {
         editor.putString("_order", order.joinToString("|")).apply()
     }
 
+    private fun imageRequest(url: String) = Request.Builder()
+        .url(url)
+        .header("User-Agent", "BearJ3rksNerdScanner/0.8 (Android)")
+        .header("Accept", "image/jpeg,image/png,image/*;q=0.8,*/*;q=0.5")
+        .build()
+
+    private fun downloadBitmap(url: String): Bitmap? = runCatching {
+        http.newCall(imageRequest(url)).execute().use { response ->
+            if (!response.isSuccessful) return@use null
+            val bytes = response.body?.bytes() ?: return@use null
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        }
+    }.getOrNull()
+
     private fun lookupPrinting(id: String) {
         lookupInFlight = true
         progress.visibility = View.VISIBLE
@@ -801,7 +836,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun apiRequest(url: String) = Request.Builder()
         .url(url)
-        .header("User-Agent", "BearJ3rksNerdScanner/0.7 (Android)")
+        .header("User-Agent", "BearJ3rksNerdScanner/0.8 (Android)")
         .header("Accept", "application/json;q=0.9,*/*;q=0.8")
         .build()
 
@@ -824,8 +859,11 @@ class MainActivity : AppCompatActivity() {
             addView(Button(this@MainActivity).apply {
                 text = "CLEAR ARTWORK CACHE"
                 setOnClickListener {
-                    getSharedPreferences("art_match_cache", MODE_PRIVATE).edit().clear().apply()
-                    Toast.makeText(this@MainActivity, "Artwork comparison cache cleared", Toast.LENGTH_SHORT).show()
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        getSharedPreferences("art_match_cache", MODE_PRIVATE).edit().clear().apply()
+                        runCatching { http.cache?.evictAll() }
+                        runOnUiThread { Toast.makeText(this@MainActivity, "Artwork and image cache cleared", Toast.LENGTH_SHORT).show() }
+                    }
                 }
             }, LinearLayout.LayoutParams(-1, dp(52)))
             addView(TextView(this@MainActivity).apply {
