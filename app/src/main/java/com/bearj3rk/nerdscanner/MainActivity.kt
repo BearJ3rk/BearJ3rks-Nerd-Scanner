@@ -149,7 +149,7 @@ class MainActivity : AppCompatActivity() {
                     setStroke(dp(3), Color.rgb(201, 154, 69))
                     cornerRadius = dp(14).toFloat()
                 }
-            }, FrameLayout.LayoutParams(dp(250), dp(350), Gravity.CENTER))
+            }, FrameLayout.LayoutParams(dp(205), dp(287), Gravity.CENTER))
             addView(TextView(this@MainActivity).apply {
                 text = "SET SYMBOL + NUMBER"
                 textSize = 11f
@@ -168,7 +168,7 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(16), dp(12), dp(16), dp(12))
         }
         progress = ProgressBar(this).apply { visibility = View.GONE }
-        root.addView(cameraFrame, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(410)))
+        root.addView(cameraFrame, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(330)))
         root.addView(status)
         root.addView(progress, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(32)))
         root.addView(ScrollView(this).apply { addView(resultPanel) }, LinearLayout.LayoutParams(-1, 0, 1f))
@@ -222,7 +222,7 @@ class MainActivity : AppCompatActivity() {
                 .build()
             analysis.setAnalyzer(cameraExecutor) { proxy ->
                 val now = System.currentTimeMillis()
-                if (lookupInFlight || now - lastLookupAt < 1800) { proxy.close(); return@setAnalyzer }
+                if (lookupInFlight || now - lastLookupAt < scanPauseMillis()) { proxy.close(); return@setAnalyzer }
                 val mediaImage = proxy.image
                 if (mediaImage == null) { proxy.close(); return@setAnalyzer }
                 val image = InputImage.fromMediaImage(mediaImage, proxy.imageInfo.rotationDegrees)
@@ -248,8 +248,8 @@ class MainActivity : AppCompatActivity() {
     private fun captureSetSymbol(): Bitmap? {
         val frame = previewView.bitmap ?: return null
         // Most modern cards place the expansion mark at the right edge, just below center.
-        val cardWidth = frame.width * 0.61f
-        val cardHeight = frame.height * 0.85f
+        val cardWidth = frame.width * 0.52f
+        val cardHeight = frame.height * 0.87f
         val cardLeft = (frame.width - cardWidth) / 2f
         val cardTop = (frame.height - cardHeight) / 2f
         val left = (cardLeft + cardWidth * 0.73f).toInt().coerceIn(0, frame.width - 2)
@@ -300,7 +300,7 @@ class MainActivity : AppCompatActivity() {
     private fun requestCard(url: String, fallbackUrl: String?) {
         val request = Request.Builder()
             .url(url)
-            .header("User-Agent", "BearJ3rksNerdScanner/0.5 (Android)")
+            .header("User-Agent", "BearJ3rksNerdScanner/0.6 (Android)")
             .header("Accept", "application/json;q=0.9,*/*;q=0.8")
             .build()
         http.newCall(request).enqueue(object : Callback {
@@ -316,7 +316,11 @@ class MainActivity : AppCompatActivity() {
                             finishLookupError(message ?: "No matching card found")
                         }
                     } else runCatching { JSONObject(body) }
-                        .onSuccess { card -> runOnUiThread { showCard(card); finishLookup() } }
+                        .onSuccess { card -> runOnUiThread {
+                            showCard(card)
+                            lastLookupAt = System.currentTimeMillis()
+                            finishLookup()
+                        } }
                         .onFailure { finishLookupError("Could not read Scryfall's response") }
                 }
             }
@@ -325,12 +329,17 @@ class MainActivity : AppCompatActivity() {
 
     private fun showCard(card: JSONObject) {
         resultPanel.removeAllViews()
-        val imageUris = card.optJSONObject("image_uris")
-            ?: card.optJSONArray("card_faces")?.optJSONObject(0)?.optJSONObject("image_uris")
+        val imageUrl = cardImageUrl(card)
         val image = ImageView(this).apply {
             adjustViewBounds = true
             scaleType = ImageView.ScaleType.FIT_CENTER
-            imageUris?.optString("normal")?.takeIf { it.isNotBlank() }?.let { load(it) }
+            contentDescription = "Matched Magic card image"
+            setBackgroundColor(Color.rgb(231, 225, 214))
+            if (imageUrl != null) load(imageUrl) {
+                crossfade(true)
+                placeholder(android.R.drawable.ic_menu_gallery)
+                error(android.R.drawable.ic_dialog_alert)
+            } else setImageResource(android.R.drawable.ic_dialog_alert)
         }
         val name = card.optString("name", "Unknown card")
         val setName = card.optString("set_name")
@@ -360,7 +369,14 @@ class MainActivity : AppCompatActivity() {
             addView(open, LinearLayout.LayoutParams(0, dp(56), 1f).apply { marginEnd = dp(4) })
             addView(changeSet, LinearLayout.LayoutParams(0, dp(56), 1f).apply { marginStart = dp(4) })
         }
-        resultPanel.addView(image, LinearLayout.LayoutParams(-1, dp(280)))
+        resultPanel.addView(TextView(this).apply {
+            text = "MATCHED CARD"
+            textSize = 13f
+            gravity = Gravity.CENTER
+            setTextColor(Color.rgb(83, 69, 49))
+            setPadding(0, 0, 0, dp(4))
+        })
+        resultPanel.addView(image, LinearLayout.LayoutParams(-1, dp(200)))
         resultPanel.addView(info)
         resultPanel.addView(Button(this).apply {
             text = "ADD TO MY LIST"
@@ -380,6 +396,21 @@ class MainActivity : AppCompatActivity() {
             pendingSetSymbol = null
             matchSetSymbol(card, symbol)
         }
+    }
+
+    private fun cardImageUrl(card: JSONObject): String? {
+        fun fromUris(uris: JSONObject?): String? {
+            if (uris == null) return null
+            return listOf("normal", "large", "small", "png", "art_crop")
+                .asSequence().map { uris.optString(it) }
+                .firstOrNull { it.startsWith("https://") }
+        }
+        fromUris(card.optJSONObject("image_uris"))?.let { return it }
+        val faces = card.optJSONArray("card_faces") ?: return null
+        for (index in 0 until faces.length()) {
+            fromUris(faces.optJSONObject(index)?.optJSONObject("image_uris"))?.let { return it }
+        }
+        return null
     }
 
     private fun addCardToList(card: JSONObject) {
@@ -728,18 +759,45 @@ class MainActivity : AppCompatActivity() {
 
     private fun apiRequest(url: String) = Request.Builder()
         .url(url)
-        .header("User-Agent", "BearJ3rksNerdScanner/0.5 (Android)")
+        .header("User-Agent", "BearJ3rksNerdScanner/0.6 (Android)")
         .header("Accept", "application/json;q=0.9,*/*;q=0.8")
         .build()
 
     private fun showSettings() {
+        val settings = getSharedPreferences("scanner_settings", MODE_PRIVATE)
+        val pauseChoices = (1..5).map { "$it second${if (it == 1) "" else "s"}" }
+        val pauseSelector = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, pauseChoices)
+            setSelection((settings.getInt("scan_pause_seconds", 1) - 1).coerceIn(0, 4))
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(8), dp(24), 0)
+            addView(TextView(this@MainActivity).apply {
+                text = "Pause after a successful scan"
+                textSize = 17f
+                setTextColor(Color.rgb(23, 21, 29))
+            })
+            addView(pauseSelector, LinearLayout.LayoutParams(-1, dp(56)))
+            addView(TextView(this@MainActivity).apply {
+                text = "Installed version: ${installedVersion()}\n\nUpdates are checked against the public GitHub releases for BearJ3rk's Nerd Scanner."
+                setPadding(0, dp(12), 0, dp(4))
+            })
+        }
         AlertDialog.Builder(this)
-            .setTitle("Update & About")
-            .setMessage("Installed version: ${installedVersion()}\n\nUpdates are securely checked against the public GitHub releases for BearJ3rk's Nerd Scanner.")
-            .setPositiveButton("CHECK FOR UPDATE") { _, _ -> checkForUpdate() }
-            .setNegativeButton("CLOSE", null)
+            .setTitle("Settings & Update")
+            .setView(content)
+            .setPositiveButton("SAVE") { _, _ ->
+                settings.edit().putInt("scan_pause_seconds", pauseSelector.selectedItemPosition + 1).apply()
+                Toast.makeText(this, "Scan pause saved", Toast.LENGTH_SHORT).show()
+            }
+            .setNeutralButton("CHECK UPDATE") { _, _ -> checkForUpdate() }
+            .setNegativeButton("CANCEL", null)
             .show()
     }
+
+    private fun scanPauseMillis(): Long = getSharedPreferences("scanner_settings", MODE_PRIVATE)
+        .getInt("scan_pause_seconds", 1).coerceIn(1, 5) * 1000L
 
     private fun checkForUpdate() {
         Toast.makeText(this, "Checking GitHub for updates…", Toast.LENGTH_SHORT).show()
