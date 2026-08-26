@@ -69,13 +69,14 @@ class MainActivity : AppCompatActivity() {
     private var lastLookupAt = 0L
     private var lookupInFlight = false
     private val setIcons = mutableMapOf<String, String>()
-    @Volatile private var pendingSetSymbol: Bitmap? = null
+    @Volatile private var pendingCardArt: Bitmap? = null
 
     private data class Printing(
         val id: String,
         val setCode: String,
         val setName: String,
-        val collectorNumber: String
+        val collectorNumber: String,
+        val artUrl: String
     )
 
     private val cameraPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -233,7 +234,7 @@ class MainActivity : AppCompatActivity() {
                         if (candidate != null) {
                             val hints = printingHints(lines)
                             runOnUiThread {
-                                pendingSetSymbol = captureSetSymbol()
+                                pendingCardArt = captureCardArt()
                                 lookupCard(candidate, hints.first, hints.second, fromCamera = true)
                             }
                         }
@@ -245,17 +246,18 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    private fun captureSetSymbol(): Bitmap? {
+    private fun captureCardArt(): Bitmap? {
         val frame = previewView.bitmap ?: return null
-        // Most modern cards place the expansion mark at the right edge, just below center.
+        // Crop the illustration inside the centered card guide. This is much larger and
+        // more camera-friendly than the small expansion symbol.
         val cardWidth = frame.width * 0.52f
         val cardHeight = frame.height * 0.87f
         val cardLeft = (frame.width - cardWidth) / 2f
         val cardTop = (frame.height - cardHeight) / 2f
-        val left = (cardLeft + cardWidth * 0.73f).toInt().coerceIn(0, frame.width - 2)
-        val top = (cardTop + cardHeight * 0.47f).toInt().coerceIn(0, frame.height - 2)
-        val width = (cardWidth * 0.22f).toInt().coerceAtMost(frame.width - left).coerceAtLeast(1)
-        val height = (cardHeight * 0.13f).toInt().coerceAtMost(frame.height - top).coerceAtLeast(1)
+        val left = (cardLeft + cardWidth * 0.09f).toInt().coerceIn(0, frame.width - 2)
+        val top = (cardTop + cardHeight * 0.12f).toInt().coerceIn(0, frame.height - 2)
+        val width = (cardWidth * 0.82f).toInt().coerceAtMost(frame.width - left).coerceAtLeast(1)
+        val height = (cardHeight * 0.42f).toInt().coerceAtMost(frame.height - top).coerceAtLeast(1)
         return runCatching { Bitmap.createBitmap(frame, left, top, width, height) }.getOrNull()
     }
 
@@ -300,7 +302,7 @@ class MainActivity : AppCompatActivity() {
     private fun requestCard(url: String, fallbackUrl: String?) {
         val request = Request.Builder()
             .url(url)
-            .header("User-Agent", "BearJ3rksNerdScanner/0.6 (Android)")
+            .header("User-Agent", "BearJ3rksNerdScanner/0.7 (Android)")
             .header("Accept", "application/json;q=0.9,*/*;q=0.8")
             .build()
         http.newCall(request).enqueue(object : Callback {
@@ -317,9 +319,9 @@ class MainActivity : AppCompatActivity() {
                         }
                     } else runCatching { JSONObject(body) }
                         .onSuccess { card -> runOnUiThread {
+                            finishLookup()
                             showCard(card)
                             lastLookupAt = System.currentTimeMillis()
-                            finishLookup()
                         } }
                         .onFailure { finishLookupError("Could not read Scryfall's response") }
                 }
@@ -392,9 +394,9 @@ class MainActivity : AppCompatActivity() {
         getSharedPreferences("recent", MODE_PRIVATE).edit()
             .putString("last_card", name).putString("last_uri", uri).apply()
         status.text = "Match found. Verify the set and collector number before using the price."
-        pendingSetSymbol?.let { symbol ->
-            pendingSetSymbol = null
-            matchSetSymbol(card, symbol)
+        pendingCardArt?.let { photographedArt ->
+            pendingCardArt = null
+            matchCardArtwork(card, photographedArt)
         }
     }
 
@@ -623,7 +625,8 @@ class MainActivity : AppCompatActivity() {
                         val item = data.optJSONObject(index) ?: continue
                         collected += Printing(
                             item.optString("id"), item.optString("set"),
-                            item.optString("set_name"), item.optString("collector_number")
+                            item.optString("set_name"), item.optString("collector_number"),
+                            artCropUrl(item).orEmpty()
                         )
                     }
                     val next = json.optString("next_page")
@@ -632,6 +635,17 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         })
+    }
+
+    private fun artCropUrl(card: JSONObject): String? {
+        card.optJSONObject("image_uris")?.optString("art_crop")
+            ?.takeIf { it.startsWith("https://") }?.let { return it }
+        val faces = card.optJSONArray("card_faces") ?: return null
+        for (index in 0 until faces.length()) {
+            faces.optJSONObject(index)?.optJSONObject("image_uris")?.optString("art_crop")
+                ?.takeIf { it.startsWith("https://") }?.let { return it }
+        }
+        return null
     }
 
     private fun ensureSetIcons(done: () -> Unit) {
@@ -695,59 +709,87 @@ class MainActivity : AppCompatActivity() {
         dialog.show()
     }
 
-    private fun matchSetSymbol(card: JSONObject, scanned: Bitmap) {
+    private fun matchCardArtwork(card: JSONObject, photographedArt: Bitmap) {
         val uri = card.optString("prints_search_uri")
         if (uri.isBlank()) return
-        status.text = "Card recognized. Comparing the photographed set symbol…"
+        lookupInFlight = true
+        progress.visibility = View.VISIBLE
+        status.text = "Card recognized. Comparing its artwork with known printings…"
         fetchPrintingPage(uri, mutableListOf()) { printings ->
-            ensureSetIcons {
-                lifecycleScope.launch(Dispatchers.IO) {
-                    val loader = ImageLoader.Builder(this@MainActivity).components { add(SvgDecoder.Factory()) }.build()
-                    val scored = printings.distinctBy { it.setCode }.mapNotNull { printing ->
-                        val iconUrl = setIcons[printing.setCode].orEmpty()
-                        if (iconUrl.isBlank()) return@mapNotNull null
+            lifecycleScope.launch(Dispatchers.IO) {
+                val photographedSignature = artworkSignature(photographedArt)
+                val loader = ImageLoader(this@MainActivity)
+                val scored = printings.filter { it.artUrl.isNotBlank() }.distinctBy { it.artUrl }.mapNotNull { printing ->
+                    val referenceSignature = cachedArtworkSignature(printing.id) ?: run {
                         val drawable = runCatching {
-                            loader.execute(ImageRequest.Builder(this@MainActivity).data(iconUrl).size(64).build()).drawable
+                            loader.execute(ImageRequest.Builder(this@MainActivity).data(printing.artUrl).size(192, 140).build()).drawable
                         }.getOrNull() ?: return@mapNotNull null
-                        printing to symbolSimilarity(scanned, drawable.toBitmap(64, 64))
-                    }.sortedByDescending { it.second }
-                    val best = scored.firstOrNull()
-                    val runnerUp = scored.getOrNull(1)?.second ?: 0.0
-                    runOnUiThread {
-                        if (best != null && best.second >= 0.52 && best.second - runnerUp >= 0.035) {
-                            status.text = "Set symbol likely matches ${best.first.setName}. Loading that printing…"
-                            lookupPrinting(best.first.id)
-                        } else {
-                            status.text = "Card found, but the set symbol was not clear enough to select automatically. Tap Change Set to verify it."
-                        }
+                        artworkSignature(drawable.toBitmap(192, 140)).also { cacheArtworkSignature(printing.id, it) }
+                    }
+                    printing to artworkSimilarity(photographedSignature, referenceSignature)
+                }.sortedByDescending { it.second }
+                val best = scored.firstOrNull()
+                runOnUiThread {
+                    if (best == null) {
+                        finishLookup()
+                        status.text = "Card found, but its comparison artwork could not be loaded. Tap Change Set to choose manually."
+                        return@runOnUiThread
+                    }
+                    val sameArtwork = printings.filter { it.artUrl == best.first.artUrl }
+                    val selected = sameArtwork.firstOrNull { it.id == card.optString("id") } ?: sameArtwork.first()
+                    val sharedNote = if (sameArtwork.size > 1) " This artwork appears in ${sameArtwork.size} printings." else ""
+                    if (selected.id == card.optString("id")) {
+                        finishLookup()
+                        status.text = "Likely artwork match: ${selected.setName} #${selected.collectorNumber}.$sharedNote Verify with Change Set if needed."
+                    } else {
+                        status.text = "Likely artwork match: ${selected.setName} #${selected.collectorNumber}.$sharedNote Loading that printing…"
+                        lookupPrinting(selected.id)
                     }
                 }
             }
         }
     }
 
-    private fun symbolSimilarity(left: Bitmap, right: Bitmap): Double {
-        fun signature(source: Bitmap): DoubleArray {
-            val bitmap = Bitmap.createScaledBitmap(source, 32, 32, true)
-            val gray = DoubleArray(32 * 32)
-            for (y in 0 until 32) for (x in 0 until 32) {
-                val pixel = bitmap.getPixel(x, y)
-                gray[y * 32 + x] = (Color.red(pixel) * .299 + Color.green(pixel) * .587 + Color.blue(pixel) * .114) / 255.0
-            }
-            val edges = DoubleArray(30 * 30)
-            var position = 0
-            for (y in 1 until 31) for (x in 1 until 31) {
-                val dx = gray[y * 32 + x + 1] - gray[y * 32 + x - 1]
-                val dy = gray[(y + 1) * 32 + x] - gray[(y - 1) * 32 + x]
-                edges[position++] = sqrt(dx * dx + dy * dy)
-            }
-            val mean = edges.average()
-            return DoubleArray(edges.size) { edges[it] - mean }
+    private fun artworkSignature(source: Bitmap): DoubleArray {
+        val bitmap = Bitmap.createScaledBitmap(source, 12, 9, true)
+        val values = DoubleArray(12 * 9 * 3)
+        var position = 0
+        for (y in 0 until 9) for (x in 0 until 12) {
+            val pixel = bitmap.getPixel(x, y)
+            values[position++] = Color.red(pixel) / 255.0
+            values[position++] = Color.green(pixel) / 255.0
+            values[position++] = Color.blue(pixel) / 255.0
         }
-        val a = signature(left); val b = signature(right)
+        // Standardize each color channel so exposure and camera white balance matter less.
+        for (channel in 0..2) {
+            val channelValues = (channel until values.size step 3).map { values[it] }
+            val mean = channelValues.average()
+            val deviation = sqrt(channelValues.sumOf { (it - mean) * (it - mean) } / channelValues.size).coerceAtLeast(0.05)
+            for (index in channel until values.size step 3) values[index] = (values[index] - mean) / deviation
+        }
+        return values
+    }
+
+    private fun artworkSimilarity(a: DoubleArray, b: DoubleArray): Double {
+        if (a.size != b.size) return -1.0
         var dot = 0.0; var aa = 0.0; var bb = 0.0
         for (index in a.indices) { dot += a[index] * b[index]; aa += a[index] * a[index]; bb += b[index] * b[index] }
         return if (aa == 0.0 || bb == 0.0) 0.0 else dot / sqrt(aa * bb)
+    }
+
+    private fun cachedArtworkSignature(id: String): DoubleArray? {
+        val encoded = getSharedPreferences("art_match_cache", MODE_PRIVATE).getString(id, null) ?: return null
+        return runCatching { encoded.split(',').map(String::toDouble).toDoubleArray() }
+            .getOrNull()?.takeIf { it.size == 12 * 9 * 3 }
+    }
+
+    private fun cacheArtworkSignature(id: String, signature: DoubleArray) {
+        val cache = getSharedPreferences("art_match_cache", MODE_PRIVATE)
+        val order = cache.getString("_order", "").orEmpty().split('|').filter { it.isNotBlank() }.toMutableList()
+        order.remove(id); order += id
+        val editor = cache.edit().putString(id, signature.joinToString(",") { "%.4f".format(java.util.Locale.US, it) })
+        while (order.size > 300) editor.remove(order.removeAt(0))
+        editor.putString("_order", order.joinToString("|")).apply()
     }
 
     private fun lookupPrinting(id: String) {
@@ -759,7 +801,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun apiRequest(url: String) = Request.Builder()
         .url(url)
-        .header("User-Agent", "BearJ3rksNerdScanner/0.6 (Android)")
+        .header("User-Agent", "BearJ3rksNerdScanner/0.7 (Android)")
         .header("Accept", "application/json;q=0.9,*/*;q=0.8")
         .build()
 
@@ -779,6 +821,13 @@ class MainActivity : AppCompatActivity() {
                 setTextColor(Color.rgb(23, 21, 29))
             })
             addView(pauseSelector, LinearLayout.LayoutParams(-1, dp(56)))
+            addView(Button(this@MainActivity).apply {
+                text = "CLEAR ARTWORK CACHE"
+                setOnClickListener {
+                    getSharedPreferences("art_match_cache", MODE_PRIVATE).edit().clear().apply()
+                    Toast.makeText(this@MainActivity, "Artwork comparison cache cleared", Toast.LENGTH_SHORT).show()
+                }
+            }, LinearLayout.LayoutParams(-1, dp(52)))
             addView(TextView(this@MainActivity).apply {
                 text = "Installed version: ${installedVersion()}\n\nUpdates are checked against the public GitHub releases for BearJ3rk's Nerd Scanner."
                 setPadding(0, dp(12), 0, dp(4))
