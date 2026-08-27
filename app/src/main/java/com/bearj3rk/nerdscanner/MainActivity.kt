@@ -73,6 +73,8 @@ class MainActivity : AppCompatActivity() {
     }
     private var lastLookupAt = 0L
     private var lookupInFlight = false
+    private var lookupFromCamera = false
+    private var historyReplacementId: String? = null
     private val setIcons = mutableMapOf<String, String>()
     @Volatile private var pendingCardArt: Bitmap? = null
 
@@ -123,9 +125,11 @@ class MainActivity : AppCompatActivity() {
         val tabs = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val scan = Button(this).apply { text = "SCAN CARD"; setOnClickListener { showScanner() } }
         val cardList = Button(this).apply { text = "MY LIST"; setOnClickListener { showCardList() } }
+        val history = Button(this).apply { text = "HISTORY"; setOnClickListener { showHistory() } }
         val search = Button(this).apply { text = "SEARCH NAME"; setOnClickListener { showManualSearch() } }
         tabs.addView(scan, LinearLayout.LayoutParams(0, dp(52), 1f))
         tabs.addView(cardList, LinearLayout.LayoutParams(0, dp(52), 1f))
+        tabs.addView(history, LinearLayout.LayoutParams(0, dp(52), 1f))
         tabs.addView(search, LinearLayout.LayoutParams(0, dp(52), 1f))
         topBar.addView(title, FrameLayout.LayoutParams(-1, dp(68)))
         topBar.addView(settings, FrameLayout.LayoutParams(dp(64), dp(68), Gravity.END or Gravity.CENTER_VERTICAL))
@@ -139,7 +143,7 @@ class MainActivity : AppCompatActivity() {
         resultPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(dp(18), dp(14), dp(18), dp(24))
+            setPadding(dp(18), dp(14), dp(18), dp(8))
         }
     }
 
@@ -156,16 +160,6 @@ class MainActivity : AppCompatActivity() {
                     cornerRadius = dp(14).toFloat()
                 }
             }, FrameLayout.LayoutParams(dp(205), dp(287), Gravity.CENTER))
-            addView(TextView(this@MainActivity).apply {
-                text = "SET SYMBOL + NUMBER"
-                textSize = 11f
-                gravity = Gravity.CENTER
-                setTextColor(Color.WHITE)
-                setBackgroundColor(Color.argb(180, 23, 21, 29))
-                setPadding(dp(8), dp(4), dp(8), dp(4))
-            }, FrameLayout.LayoutParams(dp(170), dp(30), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
-                bottomMargin = dp(34)
-            })
         }
         status = TextView(this).apply {
             text = "Center one card in the frame. Hold steady while its name is read."
@@ -291,6 +285,7 @@ class MainActivity : AppCompatActivity() {
     ) {
         if (query.length < 2 || lookupInFlight) return
         lookupInFlight = true
+        lookupFromCamera = fromCamera
         lastLookupAt = System.currentTimeMillis()
         runOnUiThread {
             progress.visibility = View.VISIBLE
@@ -307,7 +302,7 @@ class MainActivity : AppCompatActivity() {
     private fun requestCard(url: String, fallbackUrl: String?) {
         val request = Request.Builder()
             .url(url)
-            .header("User-Agent", "BearJ3rksNerdScanner/0.8 (Android)")
+            .header("User-Agent", "BearJ3rksNerdScanner/0.9 (Android)")
             .header("Accept", "application/json;q=0.9,*/*;q=0.8")
             .build()
         http.newCall(request).enqueue(object : Callback {
@@ -324,8 +319,14 @@ class MainActivity : AppCompatActivity() {
                         }
                     } else runCatching { JSONObject(body) }
                         .onSuccess { card -> runOnUiThread {
+                            val scanned = lookupFromCamera
+                            lookupFromCamera = false
+                            val replaceHistoryId = historyReplacementId
+                            historyReplacementId = null
                             finishLookup()
                             showCard(card)
+                            if (scanned) recordScannedCard(card)
+                            else if (replaceHistoryId != null) replaceLatestHistoryPrinting(replaceHistoryId, card)
                             lastLookupAt = System.currentTimeMillis()
                         } }
                         .onFailure { finishLookupError("Could not read Scryfall's response") }
@@ -352,7 +353,7 @@ class MainActivity : AppCompatActivity() {
         val prices = card.optJSONObject("prices")
         fun price(key: String, currency: String) = prices?.optString(key)?.takeIf { it.isNotBlank() && it != "null" }?.let { "$currency$it" } ?: "—"
         val info = TextView(this).apply {
-            text = "$name\n$setName · #$number\n\nUSD ${price("usd", "$")}   Foil ${price("usd_foil", "$")}\nEUR ${price("eur", "€")}" 
+            text = "$name\n$setName · #$number\n\nUSD ${price("usd", "$")}   Foil ${price("usd_foil", "$")}"
             textSize = 19f
             gravity = Gravity.CENTER
             setTextColor(Color.rgb(23, 21, 29))
@@ -392,7 +393,7 @@ class MainActivity : AppCompatActivity() {
         }, LinearLayout.LayoutParams(-1, dp(56)).apply { bottomMargin = dp(4) })
         resultPanel.addView(actions, LinearLayout.LayoutParams(-1, dp(56)).apply {
             topMargin = dp(8)
-            bottomMargin = dp(24)
+            bottomMargin = 0
         })
         getSharedPreferences("recent", MODE_PRIVATE).edit()
             .putString("last_card", name).putString("last_uri", uri).apply()
@@ -415,6 +416,91 @@ class MainActivity : AppCompatActivity() {
             urls += fromUris(faces.optJSONObject(index)?.optJSONObject("image_uris"))
         }
         return urls.distinct()
+    }
+
+    private fun historySnapshot(card: JSONObject, scannedAt: Long = System.currentTimeMillis()) = JSONObject().apply {
+        put("id", card.optString("id")); put("name", card.optString("name"))
+        put("set_name", card.optString("set_name")); put("set", card.optString("set"))
+        put("collector_number", card.optString("collector_number")); put("scryfall_uri", card.optString("scryfall_uri"))
+        put("prices", card.optJSONObject("prices") ?: JSONObject()); put("scanned_at", scannedAt)
+    }
+
+    private fun recordScannedCard(card: JSONObject) {
+        val preferences = getSharedPreferences("scan_history", MODE_PRIVATE)
+        val existing = runCatching { JSONArray(preferences.getString("cards", "[]")) }.getOrElse { JSONArray() }
+        val updated = JSONArray().put(historySnapshot(card))
+        for (index in 0 until minOf(existing.length(), 49)) updated.put(existing.optJSONObject(index))
+        preferences.edit().putString("cards", updated.toString()).apply()
+    }
+
+    private fun replaceLatestHistoryPrinting(oldId: String, card: JSONObject) {
+        val preferences = getSharedPreferences("scan_history", MODE_PRIVATE)
+        val history = runCatching { JSONArray(preferences.getString("cards", "[]")) }.getOrElse { JSONArray() }
+        for (index in 0 until history.length()) {
+            val item = history.optJSONObject(index) ?: continue
+            if (item.optString("id") == oldId) {
+                history.put(index, historySnapshot(card, item.optLong("scanned_at", System.currentTimeMillis())))
+                preferences.edit().putString("cards", history.toString()).apply()
+                return
+            }
+        }
+    }
+
+    private fun showHistory() {
+        clearContent()
+        val preferences = getSharedPreferences("scan_history", MODE_PRIVATE)
+        val history = runCatching { JSONArray(preferences.getString("cards", "[]")) }.getOrElse { JSONArray() }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(14), dp(14), dp(24))
+        }
+        container.addView(TextView(this).apply {
+            text = "Scan History"
+            textSize = 23f
+            gravity = Gravity.CENTER
+            setTextColor(Color.rgb(23, 21, 29))
+            setPadding(0, 0, 0, dp(10))
+        })
+        if (history.length() == 0) container.addView(TextView(this).apply {
+            text = "Your last 50 successful camera scans will appear here."
+            textSize = 17f; gravity = Gravity.CENTER; setPadding(dp(12), dp(40), dp(12), dp(40))
+        })
+        for (index in 0 until history.length()) {
+            val card = history.optJSONObject(index) ?: continue
+            val prices = card.optJSONObject("prices")
+            val usd = prices?.optString("usd")?.takeUnless { it == "null" || it.isBlank() } ?: "—"
+            val foil = prices?.optString("usd_foil")?.takeUnless { it == "null" || it.isBlank() } ?: "—"
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(6), dp(7), dp(2), dp(7))
+            }
+            row.addView(TextView(this).apply {
+                val preferred = card.optString("preferred_finish").takeIf { it.isNotBlank() }?.replaceFirstChar(Char::uppercase)
+                text = "${index + 1}. ${card.optString("name")}${preferred?.let { " ($it preferred)" } ?: ""}\n${card.optString("set_name")} · ${card.optString("set").uppercase()} #${card.optString("collector_number")}\nUSD \$$usd   Foil \$$foil"
+                textSize = 15f; setTextColor(Color.rgb(23, 21, 29))
+                setOnClickListener {
+                    card.optString("scryfall_uri").takeIf { it.isNotBlank() }
+                        ?.let { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(it))) }
+                }
+                setOnLongClickListener { showHistoryCardEditor(index, card); true }
+            }, LinearLayout.LayoutParams(0, -2, 1f))
+            row.addView(Button(this).apply {
+                text = "ADD"
+                contentDescription = "Add ${card.optString("name")} to the active list"
+                setOnClickListener { addCardToList(card) }
+            }, LinearLayout.LayoutParams(dp(76), dp(50)))
+            container.addView(row, LinearLayout.LayoutParams(-1, -2))
+        }
+        if (history.length() > 0) container.addView(Button(this).apply {
+            text = "CLEAR HISTORY"
+            setOnClickListener {
+                AlertDialog.Builder(this@MainActivity).setTitle("Clear scan history?")
+                    .setMessage("This removes the saved scan history but does not change your card lists.")
+                    .setPositiveButton("CLEAR") { _, _ -> preferences.edit().remove("cards").apply(); showHistory() }
+                    .setNegativeButton("CANCEL", null).show()
+            }
+        })
+        root.addView(ScrollView(this).apply { addView(container) }, LinearLayout.LayoutParams(-1, 0, 1f))
     }
 
     private fun loadCardImage(view: ImageView, urls: List<String>, index: Int = 0, lastError: String = "") {
@@ -445,6 +531,11 @@ class MainActivity : AppCompatActivity() {
         prices?.optString("usd")?.takeUnless { it.isBlank() || it == "null" }?.toDoubleOrNull()?.let { choices += "Non-foil" to it }
         prices?.optString("usd_foil")?.takeUnless { it.isBlank() || it == "null" }?.toDoubleOrNull()?.let { choices += "Foil" to it }
         if (choices.isEmpty()) choices += "Non-foil (price unavailable)" to 0.0
+        val preferred = card.optString("preferred_finish")
+        choices.firstOrNull { it.first.lowercase() == preferred }?.let {
+            addCardWithFinish(card, it.first.lowercase(), it.second)
+            return
+        }
         if (choices.size == 1) addCardWithFinish(card, choices.first().first.substringBefore(" ").lowercase(), choices.first().second)
         else AlertDialog.Builder(this)
             .setTitle("Choose card finish")
@@ -549,6 +640,7 @@ class MainActivity : AppCompatActivity() {
                     val uri = item.optString("scryfall_uri")
                     if (uri.isNotBlank()) startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(uri)))
                 }
+                setOnLongClickListener { showListCardEditor(item); true }
             }, LinearLayout.LayoutParams(0, -2, 1f))
             row.addView(Button(this).apply {
                 text = "−1"
@@ -612,6 +704,115 @@ class MainActivity : AppCompatActivity() {
             }.setNegativeButton("CANCEL", null).show()
     }
 
+    private fun showListCardEditor(item: JSONObject) {
+        AlertDialog.Builder(this).setTitle("Edit ${item.optString("name")}")
+            .setItems(arrayOf("Change set / printing", "Change foil / non-foil")) { _, which ->
+                if (which == 0) choosePrintingForEdit(item.optString("id")) { replacement ->
+                    replaceListCard(item, replacement, item.optString("finish", "non-foil"))
+                } else fetchCardJson(item.optString("id")) { card -> showListFinishPicker(item, card) }
+            }.setNegativeButton("CANCEL", null).show()
+    }
+
+    private fun showListFinishPicker(item: JSONObject, card: JSONObject) {
+        val prices = card.optJSONObject("prices")
+        val choices = mutableListOf<Pair<String, Double>>()
+        prices?.optString("usd")?.toDoubleOrNull()?.let { choices += "Non-foil — \$${"%.2f".format(it)}" to it }
+        prices?.optString("usd_foil")?.toDoubleOrNull()?.let { choices += "Foil — \$${"%.2f".format(it)}" to it }
+        if (choices.isEmpty()) { Toast.makeText(this, "No USD finish prices are available for this printing.", Toast.LENGTH_LONG).show(); return }
+        AlertDialog.Builder(this).setTitle("Choose finish")
+            .setItems(choices.map { it.first }.toTypedArray()) { _, index ->
+                val finish = if (choices[index].first.startsWith("Foil")) "foil" else "non-foil"
+                replaceListCard(item, card, finish, choices[index].second)
+            }.setNegativeButton("CANCEL", null).show()
+    }
+
+    private fun replaceListCard(oldItem: JSONObject, card: JSONObject, finish: String, explicitPrice: Double? = null) {
+        val lists = loadLists(); val listName = activeListName(lists)
+        val cards = lists.optJSONArray(listName) ?: JSONArray(); val updated = JSONArray()
+        val oldId = oldItem.optString("id"); val oldFinish = oldItem.optString("finish", "non-foil")
+        val newId = card.optString("id"); val quantity = oldItem.optInt("quantity", 1)
+        val priceKey = if (finish == "foil") "usd_foil" else "usd"
+        val unitPrice = explicitPrice ?: card.optJSONObject("prices")?.optString(priceKey)?.toDoubleOrNull() ?: 0.0
+        var replacement: JSONObject? = null
+        for (index in 0 until cards.length()) {
+            val existing = cards.optJSONObject(index) ?: continue
+            if (existing.optString("id") == oldId && existing.optString("finish", "non-foil") == oldFinish) continue
+            if (existing.optString("id") == newId && existing.optString("finish", "non-foil") == finish) replacement = existing
+            else updated.put(existing)
+        }
+        if (replacement != null) {
+            replacement!!.put("quantity", replacement!!.optInt("quantity", 1) + quantity)
+            updated.put(replacement)
+        } else updated.put(JSONObject().apply {
+            put("id", newId); put("name", card.optString("name")); put("set_name", card.optString("set_name"))
+            put("set", card.optString("set").uppercase()); put("collector_number", card.optString("collector_number"))
+            put("finish", finish); put("unit_price", unitPrice); put("quantity", quantity)
+            put("scryfall_uri", card.optString("scryfall_uri"))
+        })
+        lists.put(listName, updated); saveLists(lists); showCardList()
+    }
+
+    private fun showHistoryCardEditor(index: Int, card: JSONObject) {
+        AlertDialog.Builder(this).setTitle("Edit ${card.optString("name")}")
+            .setItems(arrayOf("Change set / printing", "Prefer non-foil", "Prefer foil", "Ask finish when adding")) { _, which ->
+                when (which) {
+                    0 -> choosePrintingForEdit(card.optString("id")) { replacement -> updateHistoryCard(index, replacement, card.optString("preferred_finish")) }
+                    1 -> setHistoryPreferredFinish(index, card, "non-foil")
+                    2 -> setHistoryPreferredFinish(index, card, "foil")
+                    else -> setHistoryPreferredFinish(index, card, "")
+                }
+            }.setNegativeButton("CANCEL", null).show()
+    }
+
+    private fun setHistoryPreferredFinish(index: Int, card: JSONObject, finish: String) {
+        if (finish.isNotBlank()) {
+            val key = if (finish == "foil") "usd_foil" else "usd"
+            if (card.optJSONObject("prices")?.optString(key)?.toDoubleOrNull() == null) {
+                Toast.makeText(this, "That finish has no USD price for this printing.", Toast.LENGTH_LONG).show(); return
+            }
+        }
+        updateHistoryCard(index, card, finish)
+    }
+
+    private fun updateHistoryCard(index: Int, card: JSONObject, preferredFinish: String) {
+        val preferences = getSharedPreferences("scan_history", MODE_PRIVATE)
+        val history = runCatching { JSONArray(preferences.getString("cards", "[]")) }.getOrElse { JSONArray() }
+        val previous = history.optJSONObject(index) ?: return
+        val replacement = historySnapshot(card, previous.optLong("scanned_at", System.currentTimeMillis()))
+        if (preferredFinish.isNotBlank()) replacement.put("preferred_finish", preferredFinish)
+        history.put(index, replacement); preferences.edit().putString("cards", history.toString()).apply(); showHistory()
+    }
+
+    private fun choosePrintingForEdit(cardId: String, selected: (JSONObject) -> Unit) {
+        fetchCardJson(cardId) { current ->
+            val uri = current.optString("prints_search_uri")
+            if (uri.isBlank()) { Toast.makeText(this, "No alternate printings were found.", Toast.LENGTH_SHORT).show(); return@fetchCardJson }
+            Toast.makeText(this, "Loading available printings…", Toast.LENGTH_SHORT).show()
+            fetchPrintingPage(uri, mutableListOf()) { printings ->
+                ensureSetIcons {
+                    runOnUiThread { showPrintingDialog(printings) { printing -> fetchCardJson(printing.id, selected) } }
+                }
+            }
+        }
+    }
+
+    private fun fetchCardJson(id: String, success: (JSONObject) -> Unit) {
+        http.newCall(apiRequest("https://api.scryfall.com/cards/${Uri.encode(id)}")).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) = runOnUiThread {
+                Toast.makeText(this@MainActivity, "Could not load that printing.", Toast.LENGTH_SHORT).show()
+            }
+            override fun onResponse(call: Call, response: Response) {
+                response.use {
+                    val card = if (it.isSuccessful) runCatching { JSONObject(it.body?.string().orEmpty()) }.getOrNull() else null
+                    runOnUiThread {
+                        if (card == null) Toast.makeText(this@MainActivity, "Could not load that printing.", Toast.LENGTH_SHORT).show()
+                        else success(card)
+                    }
+                }
+            }
+        })
+    }
+
     private fun loadPrintings(card: JSONObject) {
         val uri = card.optString("prints_search_uri")
         if (uri.isBlank() || lookupInFlight) return
@@ -624,7 +825,7 @@ class MainActivity : AppCompatActivity() {
             } else ensureSetIcons {
                 runOnUiThread {
                     finishLookup()
-                    showPrintingDialog(printings)
+                    showPrintingDialog(printings) { lookupPrinting(it.id) }
                     status.text = "Choose the set and printing you want."
                 }
             }
@@ -689,7 +890,7 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
-    private fun showPrintingDialog(printings: List<Printing>) {
+    private fun showPrintingDialog(printings: List<Printing>, onSelected: (Printing) -> Unit) {
         val list = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(8), dp(4), dp(8), dp(8))
@@ -726,7 +927,7 @@ class MainActivity : AppCompatActivity() {
             row.addView(label, LinearLayout.LayoutParams(0, -2, 1f))
             row.setOnClickListener {
                 dialog.dismiss()
-                lookupPrinting(printing.id)
+                onSelected(printing)
             }
             list.addView(row, LinearLayout.LayoutParams(-1, dp(62)))
         }
@@ -764,6 +965,7 @@ class MainActivity : AppCompatActivity() {
                         status.text = "Likely artwork match: ${selected.setName} #${selected.collectorNumber}.$sharedNote Verify with Change Set if needed."
                     } else {
                         status.text = "Likely artwork match: ${selected.setName} #${selected.collectorNumber}.$sharedNote Loading that printing…"
+                        historyReplacementId = card.optString("id").takeIf { it.isNotBlank() }
                         lookupPrinting(selected.id)
                     }
                 }
@@ -815,7 +1017,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun imageRequest(url: String) = Request.Builder()
         .url(url)
-        .header("User-Agent", "BearJ3rksNerdScanner/0.8 (Android)")
+        .header("User-Agent", "BearJ3rksNerdScanner/0.9 (Android)")
         .header("Accept", "image/jpeg,image/png,image/*;q=0.8,*/*;q=0.5")
         .build()
 
@@ -836,7 +1038,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun apiRequest(url: String) = Request.Builder()
         .url(url)
-        .header("User-Agent", "BearJ3rksNerdScanner/0.8 (Android)")
+        .header("User-Agent", "BearJ3rksNerdScanner/0.9 (Android)")
         .header("Accept", "application/json;q=0.9,*/*;q=0.8")
         .build()
 
