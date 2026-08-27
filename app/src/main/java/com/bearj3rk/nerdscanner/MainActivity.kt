@@ -123,10 +123,20 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { showSettings() }
         }
         val tabs = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val scan = Button(this).apply { text = "SCAN CARD"; setOnClickListener { showScanner() } }
-        val cardList = Button(this).apply { text = "MY LIST"; setOnClickListener { showCardList() } }
-        val history = Button(this).apply { text = "HISTORY"; setOnClickListener { showHistory() } }
-        val search = Button(this).apply { text = "SEARCH NAME"; setOnClickListener { showManualSearch() } }
+        fun tabButton(label: String, action: () -> Unit) = Button(this).apply {
+            text = label
+            gravity = Gravity.CENTER
+            includeFontPadding = false
+            setSingleLine(true)
+            setPadding(0, 0, 0, 0)
+            minimumHeight = 0
+            minimumWidth = 0
+            setOnClickListener { action() }
+        }
+        val scan = tabButton("SCAN CARD") { showScanner() }
+        val cardList = tabButton("MY LIST") { showCardList() }
+        val history = tabButton("HISTORY") { showHistory() }
+        val search = tabButton("SEARCH") { showManualSearch() }
         tabs.addView(scan, LinearLayout.LayoutParams(0, dp(52), 1f))
         tabs.addView(cardList, LinearLayout.LayoutParams(0, dp(52), 1f))
         tabs.addView(history, LinearLayout.LayoutParams(0, dp(52), 1f))
@@ -302,7 +312,7 @@ class MainActivity : AppCompatActivity() {
     private fun requestCard(url: String, fallbackUrl: String?) {
         val request = Request.Builder()
             .url(url)
-            .header("User-Agent", "BearJ3rksNerdScanner/0.9 (Android)")
+            .header("User-Agent", "BearJ3rksNerdScanner/0.10 (Android)")
             .header("Accept", "application/json;q=0.9,*/*;q=0.8")
             .build()
         http.newCall(request).enqueue(object : Callback {
@@ -939,7 +949,6 @@ class MainActivity : AppCompatActivity() {
         if (uri.isBlank()) return
         lookupInFlight = true
         progress.visibility = View.VISIBLE
-        status.text = "Card recognized. Comparing its artwork with known printings…"
         fetchPrintingPage(uri, mutableListOf()) { printings ->
             lifecycleScope.launch(Dispatchers.IO) {
                 val photographedSignature = artworkSignature(photographedArt)
@@ -954,19 +963,15 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread {
                     if (best == null) {
                         finishLookup()
-                        status.text = "Card found, but its comparison artwork could not be loaded. Tap Change Set to choose manually."
                         return@runOnUiThread
                     }
                     val sameArtwork = printings.filter { it.artUrl == best.first.artUrl }
                     val selected = sameArtwork.firstOrNull { it.id == card.optString("id") } ?: sameArtwork.first()
-                    val sharedNote = if (sameArtwork.size > 1) " This artwork appears in ${sameArtwork.size} printings." else ""
                     if (selected.id == card.optString("id")) {
                         finishLookup()
-                        status.text = "Likely artwork match: ${selected.setName} #${selected.collectorNumber}.$sharedNote Verify with Change Set if needed."
                     } else {
-                        status.text = "Likely artwork match: ${selected.setName} #${selected.collectorNumber}.$sharedNote Loading that printing…"
                         historyReplacementId = card.optString("id").takeIf { it.isNotBlank() }
-                        lookupPrinting(selected.id)
+                        lookupPrinting(selected.id, silent = true)
                     }
                 }
             }
@@ -1017,7 +1022,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun imageRequest(url: String) = Request.Builder()
         .url(url)
-        .header("User-Agent", "BearJ3rksNerdScanner/0.9 (Android)")
+        .header("User-Agent", "BearJ3rksNerdScanner/0.10 (Android)")
         .header("Accept", "image/jpeg,image/png,image/*;q=0.8,*/*;q=0.5")
         .build()
 
@@ -1029,16 +1034,16 @@ class MainActivity : AppCompatActivity() {
         }
     }.getOrNull()
 
-    private fun lookupPrinting(id: String) {
+    private fun lookupPrinting(id: String, silent: Boolean = false) {
         lookupInFlight = true
         progress.visibility = View.VISIBLE
-        status.text = "Loading selected printing…"
+        if (!silent) status.text = "Loading selected printing…"
         requestCard("https://api.scryfall.com/cards/${Uri.encode(id)}", null)
     }
 
     private fun apiRequest(url: String) = Request.Builder()
         .url(url)
-        .header("User-Agent", "BearJ3rksNerdScanner/0.9 (Android)")
+        .header("User-Agent", "BearJ3rksNerdScanner/0.10 (Android)")
         .header("Accept", "application/json;q=0.9,*/*;q=0.8")
         .build()
 
