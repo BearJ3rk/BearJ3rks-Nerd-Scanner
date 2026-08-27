@@ -23,7 +23,6 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
-import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -172,14 +171,10 @@ class MainActivity : AppCompatActivity() {
             }, FrameLayout.LayoutParams(dp(205), dp(287), Gravity.CENTER))
         }
         status = TextView(this).apply {
-            text = "Center one card in the frame. Hold steady while its name is read."
-            gravity = Gravity.CENTER
-            textSize = 16f
-            setPadding(dp(16), dp(12), dp(16), dp(12))
+            visibility = View.GONE
         }
         progress = ProgressBar(this).apply { visibility = View.GONE }
         root.addView(cameraFrame, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(330)))
-        root.addView(status)
         root.addView(progress, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(32)))
         root.addView(ScrollView(this).apply { addView(resultPanel) }, LinearLayout.LayoutParams(-1, 0, 1f))
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
@@ -216,7 +211,6 @@ class MainActivity : AppCompatActivity() {
         container.addView(input)
         container.addView(searchButton)
         container.addView(progress)
-        container.addView(status)
         container.addView(resultPanel)
         root.addView(ScrollView(this).apply { addView(container) }, LinearLayout.LayoutParams(-1, 0, 1f))
         input.requestFocus()
@@ -299,6 +293,7 @@ class MainActivity : AppCompatActivity() {
         lastLookupAt = System.currentTimeMillis()
         runOnUiThread {
             progress.visibility = View.VISIBLE
+            status.visibility = View.VISIBLE
             val printing = if (setCode != null && collectorNumber != null) " ($setCode #$collectorNumber)" else ""
             status.text = if (fromCamera) "Recognized “$query”$printing… checking Scryfall" else "Searching…"
         }
@@ -312,7 +307,7 @@ class MainActivity : AppCompatActivity() {
     private fun requestCard(url: String, fallbackUrl: String?) {
         val request = Request.Builder()
             .url(url)
-            .header("User-Agent", "BearJ3rksNerdScanner/0.10 (Android)")
+            .header("User-Agent", "BearJ3rksNerdScanner/0.11 (Android)")
             .header("Accept", "application/json;q=0.9,*/*;q=0.8")
             .build()
         http.newCall(request).enqueue(object : Callback {
@@ -363,11 +358,12 @@ class MainActivity : AppCompatActivity() {
         val prices = card.optJSONObject("prices")
         fun price(key: String, currency: String) = prices?.optString(key)?.takeIf { it.isNotBlank() && it != "null" }?.let { "$currency$it" } ?: "—"
         val info = TextView(this).apply {
-            text = "$name\n$setName · #$number\n\nUSD ${price("usd", "$")}   Foil ${price("usd_foil", "$")}"
-            textSize = 19f
+            text = "$name\n$setName · #$number\nUSD ${price("usd", "$")}   Foil ${price("usd_foil", "$")}"
+            textSize = 18f
             gravity = Gravity.CENTER
             setTextColor(Color.rgb(23, 21, 29))
-            setPadding(0, dp(12), 0, dp(12))
+            setLineSpacing(0f, 0.92f)
+            setPadding(0, dp(4), 0, dp(6))
         }
         val uri = card.optString("scryfall_uri")
         val open = Button(this).apply {
@@ -407,7 +403,7 @@ class MainActivity : AppCompatActivity() {
         })
         getSharedPreferences("recent", MODE_PRIVATE).edit()
             .putString("last_card", name).putString("last_uri", uri).apply()
-        status.text = "Match found. Verify the set and collector number before using the price."
+        status.visibility = View.GONE
         pendingCardArt?.let { photographedArt ->
             pendingCardArt = null
             matchCardArtwork(card, photographedArt)
@@ -518,7 +514,6 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread {
                 view.setImageResource(android.R.drawable.ic_dialog_alert)
                 view.contentDescription = "Card artwork failed to load${if (lastError.isBlank()) "" else ": $lastError"}"
-                Toast.makeText(this, "Card details loaded, but the artwork download failed${if (lastError.isBlank()) "." else ": $lastError"}", Toast.LENGTH_LONG).show()
             }
             return
         }
@@ -592,7 +587,6 @@ class MainActivity : AppCompatActivity() {
             put("scryfall_uri", card.optString("scryfall_uri"))
         })
         saveLists(lists)
-        Toast.makeText(this, "Added ${finish.replaceFirstChar(Char::uppercase)} to $listName", Toast.LENGTH_SHORT).show()
     }
 
     private fun showCardList() {
@@ -728,7 +722,7 @@ class MainActivity : AppCompatActivity() {
         val choices = mutableListOf<Pair<String, Double>>()
         prices?.optString("usd")?.toDoubleOrNull()?.let { choices += "Non-foil — \$${"%.2f".format(it)}" to it }
         prices?.optString("usd_foil")?.toDoubleOrNull()?.let { choices += "Foil — \$${"%.2f".format(it)}" to it }
-        if (choices.isEmpty()) { Toast.makeText(this, "No USD finish prices are available for this printing.", Toast.LENGTH_LONG).show(); return }
+        if (choices.isEmpty()) return
         AlertDialog.Builder(this).setTitle("Choose finish")
             .setItems(choices.map { it.first }.toTypedArray()) { _, index ->
                 val finish = if (choices[index].first.startsWith("Foil")) "foil" else "non-foil"
@@ -778,7 +772,7 @@ class MainActivity : AppCompatActivity() {
         if (finish.isNotBlank()) {
             val key = if (finish == "foil") "usd_foil" else "usd"
             if (card.optJSONObject("prices")?.optString(key)?.toDoubleOrNull() == null) {
-                Toast.makeText(this, "That finish has no USD price for this printing.", Toast.LENGTH_LONG).show(); return
+                return
             }
         }
         updateHistoryCard(index, card, finish)
@@ -796,8 +790,7 @@ class MainActivity : AppCompatActivity() {
     private fun choosePrintingForEdit(cardId: String, selected: (JSONObject) -> Unit) {
         fetchCardJson(cardId) { current ->
             val uri = current.optString("prints_search_uri")
-            if (uri.isBlank()) { Toast.makeText(this, "No alternate printings were found.", Toast.LENGTH_SHORT).show(); return@fetchCardJson }
-            Toast.makeText(this, "Loading available printings…", Toast.LENGTH_SHORT).show()
+            if (uri.isBlank()) return@fetchCardJson
             fetchPrintingPage(uri, mutableListOf()) { printings ->
                 ensureSetIcons {
                     runOnUiThread { showPrintingDialog(printings) { printing -> fetchCardJson(printing.id, selected) } }
@@ -808,15 +801,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun fetchCardJson(id: String, success: (JSONObject) -> Unit) {
         http.newCall(apiRequest("https://api.scryfall.com/cards/${Uri.encode(id)}")).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) = runOnUiThread {
-                Toast.makeText(this@MainActivity, "Could not load that printing.", Toast.LENGTH_SHORT).show()
-            }
+            override fun onFailure(call: Call, e: IOException) = Unit
             override fun onResponse(call: Call, response: Response) {
                 response.use {
                     val card = if (it.isSuccessful) runCatching { JSONObject(it.body?.string().orEmpty()) }.getOrNull() else null
                     runOnUiThread {
-                        if (card == null) Toast.makeText(this@MainActivity, "Could not load that printing.", Toast.LENGTH_SHORT).show()
-                        else success(card)
+                        if (card != null) success(card)
                     }
                 }
             }
@@ -828,6 +818,7 @@ class MainActivity : AppCompatActivity() {
         if (uri.isBlank() || lookupInFlight) return
         lookupInFlight = true
         progress.visibility = View.VISIBLE
+        status.visibility = View.VISIBLE
         status.text = "Loading available sets…"
         fetchPrintingPage(uri, mutableListOf()) { printings ->
             if (printings.isEmpty()) {
@@ -1022,7 +1013,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun imageRequest(url: String) = Request.Builder()
         .url(url)
-        .header("User-Agent", "BearJ3rksNerdScanner/0.10 (Android)")
+        .header("User-Agent", "BearJ3rksNerdScanner/0.11 (Android)")
         .header("Accept", "image/jpeg,image/png,image/*;q=0.8,*/*;q=0.5")
         .build()
 
@@ -1037,13 +1028,16 @@ class MainActivity : AppCompatActivity() {
     private fun lookupPrinting(id: String, silent: Boolean = false) {
         lookupInFlight = true
         progress.visibility = View.VISIBLE
-        if (!silent) status.text = "Loading selected printing…"
+        if (!silent) {
+            status.visibility = View.VISIBLE
+            status.text = "Loading selected printing…"
+        }
         requestCard("https://api.scryfall.com/cards/${Uri.encode(id)}", null)
     }
 
     private fun apiRequest(url: String) = Request.Builder()
         .url(url)
-        .header("User-Agent", "BearJ3rksNerdScanner/0.10 (Android)")
+        .header("User-Agent", "BearJ3rksNerdScanner/0.11 (Android)")
         .header("Accept", "application/json;q=0.9,*/*;q=0.8")
         .build()
 
@@ -1069,7 +1063,6 @@ class MainActivity : AppCompatActivity() {
                     lifecycleScope.launch(Dispatchers.IO) {
                         getSharedPreferences("art_match_cache", MODE_PRIVATE).edit().clear().apply()
                         runCatching { http.cache?.evictAll() }
-                        runOnUiThread { Toast.makeText(this@MainActivity, "Artwork and image cache cleared", Toast.LENGTH_SHORT).show() }
                     }
                 }
             }, LinearLayout.LayoutParams(-1, dp(52)))
@@ -1083,7 +1076,6 @@ class MainActivity : AppCompatActivity() {
             .setView(content)
             .setPositiveButton("SAVE") { _, _ ->
                 settings.edit().putInt("scan_pause_seconds", pauseSelector.selectedItemPosition + 1).apply()
-                Toast.makeText(this, "Scan pause saved", Toast.LENGTH_SHORT).show()
             }
             .setNeutralButton("CHECK UPDATE") { _, _ -> checkForUpdate() }
             .setNegativeButton("CANCEL", null)
@@ -1094,17 +1086,13 @@ class MainActivity : AppCompatActivity() {
         .getInt("scan_pause_seconds", 1).coerceIn(1, 5) * 1000L
 
     private fun checkForUpdate() {
-        Toast.makeText(this, "Checking GitHub for updates…", Toast.LENGTH_SHORT).show()
         http.newCall(apiRequest("https://api.github.com/repos/BearJ3rk/BearJ3rks-Nerd-Scanner/releases/latest"))
             .enqueue(object : Callback {
-                override fun onFailure(call: Call, e: IOException) = runOnUiThread {
-                    Toast.makeText(this@MainActivity, "Update check failed. Try again later.", Toast.LENGTH_LONG).show()
-                }
+                override fun onFailure(call: Call, e: IOException) = Unit
                 override fun onResponse(call: Call, response: Response) {
                     response.use {
                         val release = runCatching { JSONObject(it.body?.string().orEmpty()) }.getOrNull()
                         if (!it.isSuccessful || release == null) {
-                            runOnUiThread { Toast.makeText(this@MainActivity, "Could not read the latest release.", Toast.LENGTH_LONG).show() }
                             return
                         }
                         val latest = release.optString("tag_name").removePrefix("v").removePrefix("V")
@@ -1127,7 +1115,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun showUpdateResult(latest: String, downloadUrl: String) {
         if (latest.isBlank()) {
-            Toast.makeText(this, "The latest version could not be identified.", Toast.LENGTH_LONG).show()
             return
         }
         if (compareVersions(latest, installedVersion()) <= 0) {
@@ -1164,8 +1151,8 @@ class MainActivity : AppCompatActivity() {
     private fun finishLookup() { lookupInFlight = false; progress.visibility = View.GONE }
     private fun finishLookupError(message: String) = runOnUiThread {
         finishLookup()
+        status.visibility = View.VISIBLE
         status.text = message
-        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
     }
 
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
