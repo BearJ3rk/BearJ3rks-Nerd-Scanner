@@ -797,7 +797,7 @@ class MainActivity : AppCompatActivity() {
                 if (lists.length() == 0) lists.put("My List", JSONArray())
                 val nextName = lists.keys().asSequence().first()
                 saveLists(lists)
-                preferences.edit().putString("active_list", nextName).apply()
+                getSharedPreferences("card_list", MODE_PRIVATE).edit().putString("active_list", nextName).apply()
                 showCardList()
             }
             .setNegativeButton("CANCEL", null)
