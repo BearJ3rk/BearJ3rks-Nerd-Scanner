@@ -73,8 +73,13 @@ def main() -> None:
     args = parser.parse_args()
 
     bulk = json.loads(fetch("https://api.scryfall.com/bulk-data"))
-    default_cards = next(item for item in bulk["data"] if item["type"] == "default_cards")
-    cards = json.loads(fetch(default_cards["download_uri"]))
+    artwork_data = next(item for item in bulk["data"] if item["type"] == "unique_artwork")
+    download_uri = artwork_data.get("jsonl_download_uri") or artwork_data.get("download_uri")
+    raw_cards = fetch(download_uri)
+    if raw_cards[:2] == b"\x1f\x8b":
+        raw_cards = gzip.decompress(raw_cards)
+    decoded = raw_cards.decode("utf-8")
+    cards = [json.loads(line) for line in decoded.splitlines() if line.strip()] if download_uri.endswith((".jsonl", ".jsonl.gz")) else json.loads(decoded)
     prior = existing_index(args.existing)
     # Identical art cannot distinguish reprints visually, so keep one representative
     # card ID per artwork. The app can still offer Change Set after recognition.
