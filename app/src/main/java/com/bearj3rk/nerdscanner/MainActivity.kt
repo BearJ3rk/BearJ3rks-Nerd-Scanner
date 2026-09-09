@@ -80,6 +80,7 @@ class MainActivity : AppCompatActivity() {
     private var lookupFromCamera = false
     private var historyReplacementId: String? = null
     private var pendingUpdateUrl: String? = null
+    private var displayedCardId: String? = null
     private val setIcons = mutableMapOf<String, String>()
     @Volatile private var pendingCardArt: Bitmap? = null
 
@@ -258,12 +259,11 @@ class MainActivity : AppCompatActivity() {
                     .addOnSuccessListener { text ->
                         val lines = text.textBlocks.flatMap { it.lines }.map { it.text }
                         val candidate = bestCardName(lines)
-                        val hints = printingHints(lines)
-                        runOnUiThread {
-                            captureCardArt()?.let { photographedArt ->
-                                identifyFromArtworkFirst(photographedArt, candidate, hints.first, hints.second)
-                            } ?: candidate?.let {
-                                lookupCard(it, hints.first, hints.second, fromCamera = true)
+                        if (candidate != null) {
+                            val hints = printingHints(lines)
+                            runOnUiThread {
+                                pendingCardArt = captureCardArt()
+                                lookupCard(candidate, hints.first, hints.second, fromCamera = true)
                             }
                         }
                     }
@@ -306,42 +306,6 @@ class MainActivity : AppCompatActivity() {
         return setCode to collector
     }
 
-    private fun identifyFromArtworkFirst(
-        photographedArt: Bitmap,
-        ocrName: String?,
-        setCode: String?,
-        collectorNumber: String?
-    ) {
-        if (lookupInFlight) return
-        lookupInFlight = true
-        progress.visibility = View.VISIBLE
-        lifecycleScope.launch(Dispatchers.IO) {
-            val photographedSignature = artworkSignature(photographedArt)
-            val cache = getSharedPreferences("art_match_cache", MODE_PRIVATE)
-            val ids = cache.getString("_order", "").orEmpty().split('|').filter { it.isNotBlank() }
-            val best = ids.mapNotNull { id ->
-                cachedArtworkSignature(id)?.let { id to artworkSimilarity(photographedSignature, it) }
-            }.maxByOrNull { it.second }
-            runOnUiThread {
-                // A strong cached visual match identifies the card without depending on OCR.
-                // OCR remains the cold-cache fallback and then teaches the visual cache.
-                if (best != null && best.second >= 0.88) {
-                    pendingCardArt = null
-                    lookupFromCamera = true
-                    lastLookupAt = System.currentTimeMillis()
-                    lookupPrinting(best.first, silent = true)
-                } else {
-                    lookupInFlight = false
-                    progress.visibility = View.GONE
-                    if (ocrName != null) {
-                        pendingCardArt = photographedArt
-                        lookupCard(ocrName, setCode, collectorNumber, fromCamera = true)
-                    }
-                }
-            }
-        }
-    }
-
     private fun lookupCard(
         query: String,
         setCode: String? = null,
@@ -368,7 +332,7 @@ class MainActivity : AppCompatActivity() {
     private fun requestCard(url: String, fallbackUrl: String?) {
         val request = Request.Builder()
             .url(url)
-            .header("User-Agent", "BearJ3rksNerdScanner/0.14 (Android)")
+            .header("User-Agent", "BearJ3rksNerdScanner/0.15 (Android)")
             .header("Accept", "application/json;q=0.9,*/*;q=0.8")
             .build()
         http.newCall(request).enqueue(object : Callback {
@@ -402,6 +366,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showCard(card: JSONObject) {
+        displayedCardId = card.optString("id").takeIf { it.isNotBlank() }
         resultPanel.removeAllViews()
         resultActions.removeAllViews()
         val imageUrls = cardImageUrls(card)
@@ -1034,8 +999,7 @@ class MainActivity : AppCompatActivity() {
     private fun matchCardArtwork(card: JSONObject, photographedArt: Bitmap) {
         val uri = card.optString("prints_search_uri")
         if (uri.isBlank()) return
-        lookupInFlight = true
-        progress.visibility = View.VISIBLE
+        val originalId = card.optString("id")
         fetchPrintingPage(uri, mutableListOf()) { printings ->
             lifecycleScope.launch(Dispatchers.IO) {
                 val photographedSignature = artworkSignature(photographedArt)
@@ -1048,21 +1012,29 @@ class MainActivity : AppCompatActivity() {
                 }.sortedByDescending { it.second }
                 val best = scored.firstOrNull()
                 runOnUiThread {
-                    if (best == null) {
-                        finishLookup()
-                        return@runOnUiThread
-                    }
+                    if (best == null) return@runOnUiThread
                     val sameArtwork = printings.filter { it.artUrl == best.first.artUrl }
                     val selected = sameArtwork.firstOrNull { it.id == card.optString("id") } ?: sameArtwork.first()
-                    if (selected.id == card.optString("id")) {
-                        finishLookup()
-                    } else {
-                        historyReplacementId = card.optString("id").takeIf { it.isNotBlank() }
-                        lookupPrinting(selected.id, silent = true)
-                    }
+                    if (selected.id != originalId) applyArtworkCorrection(originalId, selected.id)
                 }
             }
         }
+    }
+
+    private fun applyArtworkCorrection(originalId: String, correctedId: String) {
+        http.newCall(apiRequest("https://api.scryfall.com/cards/${Uri.encode(correctedId)}")).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) = Unit
+            override fun onResponse(call: Call, response: Response) {
+                response.use {
+                    if (!it.isSuccessful) return
+                    val corrected = runCatching { JSONObject(it.body?.string().orEmpty()) }.getOrNull() ?: return
+                    runOnUiThread {
+                        replaceLatestHistoryPrinting(originalId, corrected)
+                        if (displayedCardId == originalId && !lookupInFlight) showCard(corrected)
+                    }
+                }
+            }
+        })
     }
 
     private fun artworkSignature(source: Bitmap): DoubleArray {
@@ -1109,7 +1081,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun imageRequest(url: String) = Request.Builder()
         .url(url)
-        .header("User-Agent", "BearJ3rksNerdScanner/0.14 (Android)")
+        .header("User-Agent", "BearJ3rksNerdScanner/0.15 (Android)")
         .header("Accept", "image/jpeg,image/png,image/*;q=0.8,*/*;q=0.5")
         .build()
 
@@ -1133,7 +1105,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun apiRequest(url: String) = Request.Builder()
         .url(url)
-        .header("User-Agent", "BearJ3rksNerdScanner/0.14 (Android)")
+        .header("User-Agent", "BearJ3rksNerdScanner/0.15 (Android)")
         .header("Accept", "application/json;q=0.9,*/*;q=0.8")
         .build()
 
