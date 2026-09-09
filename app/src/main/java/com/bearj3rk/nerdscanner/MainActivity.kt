@@ -258,11 +258,12 @@ class MainActivity : AppCompatActivity() {
                     .addOnSuccessListener { text ->
                         val lines = text.textBlocks.flatMap { it.lines }.map { it.text }
                         val candidate = bestCardName(lines)
-                        if (candidate != null) {
-                            val hints = printingHints(lines)
-                            runOnUiThread {
-                                pendingCardArt = captureCardArt()
-                                lookupCard(candidate, hints.first, hints.second, fromCamera = true)
+                        val hints = printingHints(lines)
+                        runOnUiThread {
+                            captureCardArt()?.let { photographedArt ->
+                                identifyFromArtworkFirst(photographedArt, candidate, hints.first, hints.second)
+                            } ?: candidate?.let {
+                                lookupCard(it, hints.first, hints.second, fromCamera = true)
                             }
                         }
                     }
@@ -305,6 +306,42 @@ class MainActivity : AppCompatActivity() {
         return setCode to collector
     }
 
+    private fun identifyFromArtworkFirst(
+        photographedArt: Bitmap,
+        ocrName: String?,
+        setCode: String?,
+        collectorNumber: String?
+    ) {
+        if (lookupInFlight) return
+        lookupInFlight = true
+        progress.visibility = View.VISIBLE
+        lifecycleScope.launch(Dispatchers.IO) {
+            val photographedSignature = artworkSignature(photographedArt)
+            val cache = getSharedPreferences("art_match_cache", MODE_PRIVATE)
+            val ids = cache.getString("_order", "").orEmpty().split('|').filter { it.isNotBlank() }
+            val best = ids.mapNotNull { id ->
+                cachedArtworkSignature(id)?.let { id to artworkSimilarity(photographedSignature, it) }
+            }.maxByOrNull { it.second }
+            runOnUiThread {
+                // A strong cached visual match identifies the card without depending on OCR.
+                // OCR remains the cold-cache fallback and then teaches the visual cache.
+                if (best != null && best.second >= 0.88) {
+                    pendingCardArt = null
+                    lookupFromCamera = true
+                    lastLookupAt = System.currentTimeMillis()
+                    lookupPrinting(best.first, silent = true)
+                } else {
+                    lookupInFlight = false
+                    progress.visibility = View.GONE
+                    if (ocrName != null) {
+                        pendingCardArt = photographedArt
+                        lookupCard(ocrName, setCode, collectorNumber, fromCamera = true)
+                    }
+                }
+            }
+        }
+    }
+
     private fun lookupCard(
         query: String,
         setCode: String? = null,
@@ -331,7 +368,7 @@ class MainActivity : AppCompatActivity() {
     private fun requestCard(url: String, fallbackUrl: String?) {
         val request = Request.Builder()
             .url(url)
-            .header("User-Agent", "BearJ3rksNerdScanner/0.12 (Android)")
+            .header("User-Agent", "BearJ3rksNerdScanner/0.14 (Android)")
             .header("Accept", "application/json;q=0.9,*/*;q=0.8")
             .build()
         http.newCall(request).enqueue(object : Callback {
@@ -643,7 +680,7 @@ class MainActivity : AppCompatActivity() {
         val listHeader = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(selector, LinearLayout.LayoutParams(0, dp(56), 1f))
-            addView(Button(this@MainActivity).apply { text = "NEW LIST"; setOnClickListener { createNewList() } }, LinearLayout.LayoutParams(dp(120), dp(56)))
+            addView(Button(this@MainActivity).apply { text = "EDIT LISTS"; setOnClickListener { showListEditor() } }, LinearLayout.LayoutParams(dp(120), dp(56)))
         }
         container.addView(TextView(this).apply { text = "My Lists"; textSize = 23f; gravity = Gravity.CENTER })
         container.addView(listHeader)
@@ -734,6 +771,37 @@ class MainActivity : AppCompatActivity() {
                 getSharedPreferences("card_list", MODE_PRIVATE).edit().putString("active_list", name).apply()
                 showCardList()
             }.setNegativeButton("CANCEL", null).show()
+    }
+
+    private fun showListEditor() {
+        val lists = loadLists()
+        val currentName = activeListName(lists)
+        AlertDialog.Builder(this)
+            .setTitle("Edit Lists")
+            .setItems(arrayOf("Add a new list", "Delete \"$currentName\"")) { _, which ->
+                if (which == 0) createNewList() else confirmDeleteList(currentName)
+            }
+            .setNegativeButton("CANCEL", null)
+            .show()
+    }
+
+    private fun confirmDeleteList(listName: String) {
+        val lists = loadLists()
+        val cardCount = lists.optJSONArray(listName)?.length() ?: 0
+        val detail = if (cardCount == 1) "It contains 1 card entry." else "It contains $cardCount card entries."
+        AlertDialog.Builder(this)
+            .setTitle("Delete \"$listName\"?")
+            .setMessage("$detail This cannot be undone.")
+            .setPositiveButton("DELETE") { _, _ ->
+                lists.remove(listName)
+                if (lists.length() == 0) lists.put("My List", JSONArray())
+                val nextName = lists.keys().asSequence().first()
+                saveLists(lists)
+                preferences.edit().putString("active_list", nextName).apply()
+                showCardList()
+            }
+            .setNegativeButton("CANCEL", null)
+            .show()
     }
 
     private fun showListCardEditor(item: JSONObject) {
@@ -1041,7 +1109,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun imageRequest(url: String) = Request.Builder()
         .url(url)
-        .header("User-Agent", "BearJ3rksNerdScanner/0.12 (Android)")
+        .header("User-Agent", "BearJ3rksNerdScanner/0.14 (Android)")
         .header("Accept", "image/jpeg,image/png,image/*;q=0.8,*/*;q=0.5")
         .build()
 
@@ -1065,7 +1133,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun apiRequest(url: String) = Request.Builder()
         .url(url)
-        .header("User-Agent", "BearJ3rksNerdScanner/0.12 (Android)")
+        .header("User-Agent", "BearJ3rksNerdScanner/0.14 (Android)")
         .header("Accept", "application/json;q=0.9,*/*;q=0.8")
         .build()
 
