@@ -61,6 +61,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var previewView: PreviewView
     private lateinit var status: TextView
     private lateinit var resultPanel: LinearLayout
+    private lateinit var resultActions: LinearLayout
     private lateinit var progress: ProgressBar
     private val cameraExecutor = Executors.newSingleThreadExecutor()
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
@@ -154,6 +155,14 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.CENTER_HORIZONTAL
             setPadding(dp(18), dp(14), dp(18), dp(8))
         }
+        resultActions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+            setBackgroundColor(Color.rgb(245, 240, 230))
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+            elevation = dp(8).toFloat()
+        }
     }
 
     private fun showScanner() {
@@ -177,6 +186,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(cameraFrame, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(330)))
         root.addView(progress, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(32)))
         root.addView(ScrollView(this).apply { addView(resultPanel) }, LinearLayout.LayoutParams(-1, 0, 1f))
+        root.addView(resultActions, LinearLayout.LayoutParams(-1, dp(64)))
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             startCamera()
         } else cameraPermission.launch(Manifest.permission.CAMERA)
@@ -213,6 +223,7 @@ class MainActivity : AppCompatActivity() {
         container.addView(progress)
         container.addView(resultPanel)
         root.addView(ScrollView(this).apply { addView(container) }, LinearLayout.LayoutParams(-1, 0, 1f))
+        root.addView(resultActions, LinearLayout.LayoutParams(-1, dp(64)))
         input.requestFocus()
     }
 
@@ -307,7 +318,7 @@ class MainActivity : AppCompatActivity() {
     private fun requestCard(url: String, fallbackUrl: String?) {
         val request = Request.Builder()
             .url(url)
-            .header("User-Agent", "BearJ3rksNerdScanner/0.11 (Android)")
+            .header("User-Agent", "BearJ3rksNerdScanner/0.12 (Android)")
             .header("Accept", "application/json;q=0.9,*/*;q=0.8")
             .build()
         http.newCall(request).enqueue(object : Callback {
@@ -342,6 +353,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun showCard(card: JSONObject) {
         resultPanel.removeAllViews()
+        resultActions.removeAllViews()
         val imageUrls = cardImageUrls(card)
         val image = ImageView(this).apply {
             adjustViewBounds = true
@@ -376,11 +388,6 @@ class MainActivity : AppCompatActivity() {
             isEnabled = card.optString("prints_search_uri").isNotBlank()
             setOnClickListener { loadPrintings(card) }
         }
-        val actions = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(open, LinearLayout.LayoutParams(0, dp(56), 1f).apply { marginEnd = dp(4) })
-            addView(changeSet, LinearLayout.LayoutParams(0, dp(56), 1f).apply { marginStart = dp(4) })
-        }
         resultPanel.addView(TextView(this).apply {
             text = "MATCHED CARD"
             textSize = 13f
@@ -390,17 +397,24 @@ class MainActivity : AppCompatActivity() {
         })
         resultPanel.addView(image, LinearLayout.LayoutParams(-1, dp(200)))
         resultPanel.addView(info)
-        resultPanel.addView(Button(this).apply {
-            text = "ADD TO MY LIST"
+        val addToList = Button(this).apply {
+            text = "ADD TO LIST"
             setOnClickListener {
                 addCardToList(card)
-                text = "ADD ANOTHER COPY"
+                text = "ADD ANOTHER"
             }
-        }, LinearLayout.LayoutParams(-1, dp(56)).apply { bottomMargin = dp(4) })
-        resultPanel.addView(actions, LinearLayout.LayoutParams(-1, dp(56)).apply {
-            topMargin = dp(8)
-            bottomMargin = 0
-        })
+        }
+        open.text = "OPEN SCRYFALL"
+        listOf(addToList, open, changeSet).forEach {
+            it.textSize = 11f
+            it.gravity = Gravity.CENTER
+            it.setSingleLine(true)
+            it.setPadding(dp(2), 0, dp(2), 0)
+        }
+        resultActions.addView(addToList, LinearLayout.LayoutParams(0, dp(56), 1f).apply { marginEnd = dp(2) })
+        resultActions.addView(open, LinearLayout.LayoutParams(0, dp(56), 1f).apply { marginStart = dp(2); marginEnd = dp(2) })
+        resultActions.addView(changeSet, LinearLayout.LayoutParams(0, dp(56), 1f).apply { marginStart = dp(2) })
+        resultActions.visibility = View.VISIBLE
         getSharedPreferences("recent", MODE_PRIVATE).edit()
             .putString("last_card", name).putString("last_uri", uri).apply()
         status.visibility = View.GONE
@@ -1013,7 +1027,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun imageRequest(url: String) = Request.Builder()
         .url(url)
-        .header("User-Agent", "BearJ3rksNerdScanner/0.11 (Android)")
+        .header("User-Agent", "BearJ3rksNerdScanner/0.12 (Android)")
         .header("Accept", "image/jpeg,image/png,image/*;q=0.8,*/*;q=0.5")
         .build()
 
@@ -1037,7 +1051,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun apiRequest(url: String) = Request.Builder()
         .url(url)
-        .header("User-Agent", "BearJ3rksNerdScanner/0.11 (Android)")
+        .header("User-Agent", "BearJ3rksNerdScanner/0.12 (Android)")
         .header("Accept", "application/json;q=0.9,*/*;q=0.8")
         .build()
 
