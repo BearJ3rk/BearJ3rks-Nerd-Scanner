@@ -9,6 +9,8 @@ import android.graphics.BitmapFactory
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
+import android.os.Build
+import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
@@ -23,6 +25,7 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -32,6 +35,7 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.lifecycle.lifecycleScope
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
@@ -75,6 +79,7 @@ class MainActivity : AppCompatActivity() {
     private var lookupInFlight = false
     private var lookupFromCamera = false
     private var historyReplacementId: String? = null
+    private var pendingUpdateUrl: String? = null
     private val setIcons = mutableMapOf<String, String>()
     @Volatile private var pendingCardArt: Bitmap? = null
 
@@ -88,6 +93,14 @@ class MainActivity : AppCompatActivity() {
 
     private val cameraPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) startCamera() else status.text = "Camera permission denied. Manual search still works."
+    }
+
+    private val installPermission = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        val url = pendingUpdateUrl
+        if (url != null && (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || packageManager.canRequestPackageInstalls())) {
+            pendingUpdateUrl = null
+            downloadAndInstallUpdate(url)
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -507,7 +520,7 @@ class MainActivity : AppCompatActivity() {
             row.addView(Button(this).apply {
                 text = "ADD"
                 contentDescription = "Add ${card.optString("name")} to the active list"
-                setOnClickListener { addCardToList(card) }
+                setOnClickListener { addCardToList(card, showConfirmation = true) }
             }, LinearLayout.LayoutParams(dp(76), dp(50)))
             container.addView(row, LinearLayout.LayoutParams(-1, -2))
         }
@@ -544,7 +557,7 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
-    private fun addCardToList(card: JSONObject) {
+    private fun addCardToList(card: JSONObject, showConfirmation: Boolean = false) {
         val prices = card.optJSONObject("prices")
         val choices = mutableListOf<Pair<String, Double>>()
         prices?.optString("usd")?.takeUnless { it.isBlank() || it == "null" }?.toDoubleOrNull()?.let { choices += "Non-foil" to it }
@@ -552,14 +565,14 @@ class MainActivity : AppCompatActivity() {
         if (choices.isEmpty()) choices += "Non-foil (price unavailable)" to 0.0
         val preferred = card.optString("preferred_finish")
         choices.firstOrNull { it.first.lowercase() == preferred }?.let {
-            addCardWithFinish(card, it.first.lowercase(), it.second)
+            addCardWithFinish(card, it.first.lowercase(), it.second, showConfirmation)
             return
         }
-        if (choices.size == 1) addCardWithFinish(card, choices.first().first.substringBefore(" ").lowercase(), choices.first().second)
+        if (choices.size == 1) addCardWithFinish(card, choices.first().first.substringBefore(" ").lowercase(), choices.first().second, showConfirmation)
         else AlertDialog.Builder(this)
             .setTitle("Choose card finish")
             .setItems(choices.map { "${it.first} — \$${"%.2f".format(it.second)}" }.toTypedArray()) { _, which ->
-                addCardWithFinish(card, choices[which].first.lowercase(), choices[which].second)
+                addCardWithFinish(card, choices[which].first.lowercase(), choices[which].second, showConfirmation)
             }.setNegativeButton("CANCEL", null).show()
     }
 
@@ -584,7 +597,7 @@ class MainActivity : AppCompatActivity() {
         return lists.keys().asSequence().firstOrNull() ?: "My List"
     }
 
-    private fun addCardWithFinish(card: JSONObject, finish: String, unitPrice: Double) {
+    private fun addCardWithFinish(card: JSONObject, finish: String, unitPrice: Double, showConfirmation: Boolean = false) {
         val lists = loadLists()
         val listName = activeListName(lists)
         val cards = lists.optJSONArray(listName) ?: JSONArray().also { lists.put(listName, it) }
@@ -601,6 +614,7 @@ class MainActivity : AppCompatActivity() {
             put("scryfall_uri", card.optString("scryfall_uri"))
         })
         saveLists(lists)
+        if (showConfirmation) Toast.makeText(this, "Added to $listName", Toast.LENGTH_SHORT).show()
     }
 
     private fun showCardList() {
@@ -1110,7 +1124,6 @@ class MainActivity : AppCompatActivity() {
                             return
                         }
                         val latest = release.optString("tag_name").removePrefix("v").removePrefix("V")
-                        val releasePage = release.optString("html_url")
                         val assets = release.optJSONArray("assets")
                         var apkUrl = ""
                         if (assets != null) for (index in 0 until assets.length()) {
@@ -1120,8 +1133,7 @@ class MainActivity : AppCompatActivity() {
                                 break
                             }
                         }
-                        val target = apkUrl.ifBlank { releasePage }
-                        runOnUiThread { showUpdateResult(latest, target) }
+                        runOnUiThread { showUpdateResult(latest, apkUrl) }
                     }
                 }
             })
@@ -1141,12 +1153,100 @@ class MainActivity : AppCompatActivity() {
         }
         AlertDialog.Builder(this)
             .setTitle("Version $latest available")
-            .setMessage("Download the new APK from the official GitHub release. Android will ask you to approve the installation.")
-            .setPositiveButton("DOWNLOAD UPDATE") { _, _ ->
-                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(downloadUrl)))
-            }
+            .setMessage(if (downloadUrl.isBlank()) "This release does not contain an installable APK." else "Download and install the signed update inside the app. Android will ask you to approve the installation.")
+            .setPositiveButton("UPDATE NOW") { _, _ -> if (downloadUrl.isNotBlank()) beginInAppUpdate(downloadUrl) }
             .setNegativeButton("LATER", null)
             .show()
+    }
+
+    private fun beginInAppUpdate(downloadUrl: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {
+            pendingUpdateUrl = downloadUrl
+            AlertDialog.Builder(this)
+                .setTitle("Allow app updates")
+                .setMessage("Android needs one-time permission for BearJ3rk's Nerd Scanner to install its downloaded updates.")
+                .setPositiveButton("OPEN ANDROID SETTING") { _, _ ->
+                    installPermission.launch(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
+                }
+                .setNegativeButton("CANCEL") { _, _ -> pendingUpdateUrl = null }
+                .show()
+            return
+        }
+        downloadAndInstallUpdate(downloadUrl)
+    }
+
+    private fun downloadAndInstallUpdate(downloadUrl: String) {
+        val bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 100; isIndeterminate = true }
+        val label = TextView(this).apply { text = "Downloading signed update…"; gravity = Gravity.CENTER; setPadding(0, dp(8), 0, 0) }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; setPadding(dp(24), dp(16), dp(24), dp(8)); addView(bar); addView(label)
+        }
+        val dialog = AlertDialog.Builder(this).setTitle("Updating").setView(content).setCancelable(false).create()
+        dialog.show()
+        val request = Request.Builder().url(downloadUrl)
+            .header("User-Agent", "BearJ3rksNerdScanner/${installedVersion()} (Android)")
+            .header("Accept", "application/vnd.android.package-archive,application/octet-stream,*/*;q=0.5")
+            .build()
+        http.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) = runOnUiThread {
+                dialog.dismiss(); showUpdateDownloadError()
+            }
+            override fun onResponse(call: Call, response: Response) {
+                response.use {
+                    val body = it.body
+                    if (!it.isSuccessful || body == null) {
+                        runOnUiThread { dialog.dismiss(); showUpdateDownloadError() }
+                        return
+                    }
+                    val updateDir = File(cacheDir, "updates").apply { mkdirs() }
+                    val apk = File(updateDir, "BearJ3rks-Nerd-Scanner-update.apk")
+                    val total = body.contentLength()
+                    var downloaded = 0L
+                    var lastPercent = -1
+                    runCatching {
+                        body.byteStream().use { input ->
+                            apk.outputStream().use { output ->
+                                val buffer = ByteArray(32 * 1024)
+                                while (true) {
+                                    val count = input.read(buffer)
+                                    if (count < 0) break
+                                    output.write(buffer, 0, count); downloaded += count
+                                    if (total > 0) {
+                                        val percent = (downloaded * 100 / total).toInt()
+                                        if (percent >= lastPercent + 2) {
+                                            lastPercent = percent
+                                            runOnUiThread { bar.isIndeterminate = false; bar.progress = percent; label.text = "Downloading… $percent%" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }.onFailure {
+                        runOnUiThread { dialog.dismiss(); showUpdateDownloadError() }
+                        return
+                    }
+                    val validApk = apk.length() > 1024 && apk.inputStream().use { input -> input.read() == 0x50 && input.read() == 0x4B }
+                    runOnUiThread {
+                        dialog.dismiss()
+                        if (validApk) launchPackageInstaller(apk) else showUpdateDownloadError()
+                    }
+                }
+            }
+        })
+    }
+
+    private fun launchPackageInstaller(apk: File) {
+        val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", apk)
+        startActivity(Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, "application/vnd.android.package-archive")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+        })
+    }
+
+    private fun showUpdateDownloadError() {
+        AlertDialog.Builder(this).setTitle("Update failed")
+            .setMessage("The signed APK could not be downloaded. Check your connection and try again from Settings.")
+            .setPositiveButton("OK", null).show()
     }
 
     private fun compareVersions(left: String, right: String): Int {
