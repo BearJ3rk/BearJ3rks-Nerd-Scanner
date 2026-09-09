@@ -54,6 +54,7 @@ import org.json.JSONObject
 import org.json.JSONArray
 import java.io.IOException
 import java.io.File
+import java.util.zip.GZIPInputStream
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
@@ -83,6 +84,7 @@ class MainActivity : AppCompatActivity() {
     private var displayedCardId: String? = null
     private val setIcons = mutableMapOf<String, String>()
     @Volatile private var pendingCardArt: Bitmap? = null
+    @Volatile private var visualIndex: List<VisualFingerprint> = emptyList()
 
     private data class Printing(
         val id: String,
@@ -91,6 +93,8 @@ class MainActivity : AppCompatActivity() {
         val collectorNumber: String,
         val artUrl: String
     )
+
+    private data class VisualFingerprint(val id: String, val hashes: LongArray)
 
     private val cameraPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) startCamera() else status.text = "Camera permission denied. Manual search still works."
@@ -107,6 +111,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         buildUi()
+        lifecycleScope.launch(Dispatchers.IO) { loadVisualIndex() }
         showScanner()
     }
 
@@ -259,10 +264,12 @@ class MainActivity : AppCompatActivity() {
                     .addOnSuccessListener { text ->
                         val lines = text.textBlocks.flatMap { it.lines }.map { it.text }
                         val candidate = bestCardName(lines)
-                        if (candidate != null) {
-                            val hints = printingHints(lines)
-                            runOnUiThread {
-                                pendingCardArt = captureCardArt()
+                        val hints = printingHints(lines)
+                        runOnUiThread {
+                            val art = captureCardArt()
+                            if (art != null && visualIndex.isNotEmpty()) identifyWithVisualIndex(art, candidate, hints.first, hints.second)
+                            else if (candidate != null) {
+                                pendingCardArt = art
                                 lookupCard(candidate, hints.first, hints.second, fromCamera = true)
                             }
                         }
@@ -306,6 +313,73 @@ class MainActivity : AppCompatActivity() {
         return setCode to collector
     }
 
+    private fun identifyWithVisualIndex(art: Bitmap, ocrName: String?, setCode: String?, collectorNumber: String?) {
+        if (lookupInFlight) return
+        lookupInFlight = true
+        lifecycleScope.launch(Dispatchers.IO) {
+            val query = visualFingerprint(art)
+            var best: VisualFingerprint? = null
+            var bestScore = Int.MAX_VALUE
+            var secondScore = Int.MAX_VALUE
+            for (entry in visualIndex) {
+                var score = 0
+                for (index in entry.hashes.indices) score += java.lang.Long.bitCount(entry.hashes[index] xor query[index])
+                if (score < bestScore) {
+                    secondScore = bestScore
+                    bestScore = score
+                    best = entry
+                } else if (score < secondScore) secondScore = score
+            }
+            val confident = best != null && bestScore <= 58 && (secondScore == Int.MAX_VALUE || secondScore - bestScore >= 6)
+            runOnUiThread {
+                lookupInFlight = false
+                if (confident) {
+                    pendingCardArt = null
+                    lookupFromCamera = true
+                    lookupPrinting(best!!.id, silent = true)
+                } else if (ocrName != null) {
+                    pendingCardArt = art
+                    lookupCard(ocrName, setCode, collectorNumber, fromCamera = true)
+                }
+            }
+        }
+    }
+
+    private fun visualFingerprint(source: Bitmap): LongArray {
+        val bitmap = Bitmap.createScaledBitmap(source, 16, 16, true)
+        val levels = IntArray(256)
+        var total = 0L
+        for (y in 0 until 16) for (x in 0 until 16) {
+            val pixel = bitmap.getPixel(x, y)
+            val level = (Color.red(pixel) * 299 + Color.green(pixel) * 587 + Color.blue(pixel) * 114) / 1000
+            levels[y * 16 + x] = level
+            total += level
+        }
+        val mean = (total / levels.size).toInt()
+        return LongArray(4) { block ->
+            var value = 0L
+            for (bit in 0 until 64) if (levels[block * 64 + bit] >= mean) value = value or (1L shl bit)
+            value
+        }
+    }
+
+    private fun visualIndexFile() = File(filesDir, "visual-index.tsv.gz")
+
+    private fun loadVisualIndex() {
+        val file = visualIndexFile()
+        if (!file.exists()) return
+        visualIndex = runCatching {
+            GZIPInputStream(file.inputStream()).bufferedReader().useLines { lines ->
+                lines.mapNotNull { line ->
+                    val columns = line.split('\t')
+                    if (columns.size != 5) null else runCatching {
+                        VisualFingerprint(columns[0], LongArray(4) { java.lang.Long.parseUnsignedLong(columns[it + 1], 16) })
+                    }.getOrNull()
+                }.toList()
+            }
+        }.getOrElse { emptyList() }
+    }
+
     private fun lookupCard(
         query: String,
         setCode: String? = null,
@@ -332,7 +406,7 @@ class MainActivity : AppCompatActivity() {
     private fun requestCard(url: String, fallbackUrl: String?) {
         val request = Request.Builder()
             .url(url)
-            .header("User-Agent", "BearJ3rksNerdScanner/0.15 (Android)")
+            .header("User-Agent", "BearJ3rksNerdScanner/0.16 (Android)")
             .header("Accept", "application/json;q=0.9,*/*;q=0.8")
             .build()
         http.newCall(request).enqueue(object : Callback {
@@ -1081,7 +1155,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun imageRequest(url: String) = Request.Builder()
         .url(url)
-        .header("User-Agent", "BearJ3rksNerdScanner/0.15 (Android)")
+        .header("User-Agent", "BearJ3rksNerdScanner/0.16 (Android)")
         .header("Accept", "image/jpeg,image/png,image/*;q=0.8,*/*;q=0.5")
         .build()
 
@@ -1105,7 +1179,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun apiRequest(url: String) = Request.Builder()
         .url(url)
-        .header("User-Agent", "BearJ3rksNerdScanner/0.15 (Android)")
+        .header("User-Agent", "BearJ3rksNerdScanner/0.16 (Android)")
         .header("Accept", "application/json;q=0.9,*/*;q=0.8")
         .build()
 
@@ -1134,8 +1208,13 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             }, LinearLayout.LayoutParams(-1, dp(52)))
+            addView(Button(this@MainActivity).apply {
+                text = if (visualIndexFile().exists()) "UPDATE VISUAL DATABASE" else "DOWNLOAD VISUAL DATABASE"
+                setOnClickListener { downloadVisualIndex(this) }
+            }, LinearLayout.LayoutParams(-1, dp(52)))
             addView(TextView(this@MainActivity).apply {
-                text = "Installed version: ${installedVersion()}\n\nUpdates are checked against the public GitHub releases for BearJ3rk's Nerd Scanner."
+                val databaseState = if (visualIndex.isEmpty()) "Not installed" else "${visualIndex.size} card printings installed"
+                text = "Visual database: $databaseState\nInstalled version: ${installedVersion()}\n\nUpdates are checked against the public GitHub releases for BearJ3rk's Nerd Scanner."
                 setPadding(0, dp(12), 0, dp(4))
             })
         }
@@ -1148,6 +1227,38 @@ class MainActivity : AppCompatActivity() {
             .setNeutralButton("CHECK UPDATE") { _, _ -> checkForUpdate() }
             .setNegativeButton("CANCEL", null)
             .show()
+    }
+
+    private fun downloadVisualIndex(button: Button) {
+        button.isEnabled = false
+        button.text = "DOWNLOADING…"
+        val url = "https://github.com/BearJ3rk/BearJ3rks-Nerd-Scanner/releases/download/visual-index-latest/visual-index.tsv.gz"
+        http.newCall(imageRequest(url)).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) = runOnUiThread {
+                button.isEnabled = true
+                button.text = "DOWNLOAD FAILED — RETRY"
+            }
+            override fun onResponse(call: Call, response: Response) {
+                response.use {
+                    val destination = visualIndexFile()
+                    val temporary = File(filesDir, "visual-index.download")
+                    val saved = it.isSuccessful && runCatching {
+                        it.body?.byteStream()?.use { input -> temporary.outputStream().use { output -> input.copyTo(output) } }
+                        GZIPInputStream(temporary.inputStream()).bufferedReader().use { reader ->
+                            require(reader.readLine()?.split('\t')?.size == 5)
+                        }
+                        if (destination.exists()) destination.delete()
+                        require(temporary.renameTo(destination))
+                    }.isSuccess
+                    if (!saved) temporary.delete()
+                    if (saved) loadVisualIndex()
+                    runOnUiThread {
+                        button.isEnabled = true
+                        button.text = if (saved) "VISUAL DATABASE READY (${visualIndex.size})" else "DOWNLOAD FAILED — RETRY"
+                    }
+                }
+            }
+        })
     }
 
     private fun scanPauseMillis(): Long = getSharedPreferences("scanner_settings", MODE_PRIVATE)
