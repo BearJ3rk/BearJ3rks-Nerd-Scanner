@@ -29,5 +29,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view visual-index-latest >/dev/null 2>&1 || gh release create visual-index-latest --title "Visual Recognition Database" --notes "Automatically generated compact card-art fingerprints. This is downloaded optionally by the app and is not bundled in the APK."
+          gh release view visual-index-latest >/dev/null 2>&1 || gh release create visual-index-latest --prerelease --title "Visual Recognition Database" --notes "Automatically generated compact card-art fingerprints. This is downloaded optionally by the app and is not bundled in the APK."
           gh release upload visual-index-latest visual-index.tsv.gz --clobber
