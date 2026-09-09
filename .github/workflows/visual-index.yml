@@ -1,0 +1,33 @@
+name: Build Visual Recognition Database
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 9 1 * *"
+
+permissions:
+  contents: write
+
+jobs:
+  build-index:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install image tools
+        run: python -m pip install --disable-pip-version-check pillow
+      - name: Download previous database when available
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download visual-index-latest --pattern visual-index.tsv.gz --dir previous || true
+      - name: Build updated visual database
+        run: python tools/build_visual_index.py --existing previous/visual-index.tsv.gz --output visual-index.tsv.gz
+      - name: Publish database separately from the APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view visual-index-latest >/dev/null 2>&1 || gh release create visual-index-latest --title "Visual Recognition Database" --notes "Automatically generated compact card-art fingerprints. This is downloaded optionally by the app and is not bundled in the APK."
+          gh release upload visual-index-latest visual-index.tsv.gz --clobber
